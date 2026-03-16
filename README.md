@@ -130,6 +130,23 @@ RadioFed/
 | `/status` | GET | Server status |
 | `/health` | GET | Health check |
 
+## Docker
+
+```bash
+docker compose up --build
+```
+
+Starts all services: server (:8000), dashboard (:7860), data manager (:7862), and 2 clients (:7861, :7863). Clients wait for the server health check before starting.
+
+Run individual services:
+
+```bash
+docker build -t radiofed .
+docker run -p 8000:8000 -p 7860:7860 radiofed uv run python central/main.py
+docker run -p 7862:7862 radiofed uv run python data/manager.py
+docker run -p 7861:7861 radiofed uv run python client/main.py --port 7861 --client-id client_0
+```
+
 ## Tests
 
 ```bash
@@ -138,4 +155,4 @@ uv run pytest tests/ -v
 
 ## Tech Stack
 
-FastHTML, HTMX, FastAPI, scikit-learn, Manim, Matplotlib, uv
+FastHTML, HTMX, FastAPI, scikit-learn, Manim, Matplotlib, Docker, uv

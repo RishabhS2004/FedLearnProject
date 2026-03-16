@@ -1,0 +1,35 @@
+services:
+  server:
+    build: .
+    command: uv run python central/main.py
+    ports:
+      - "8000:8000"
+      - "7860:7860"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      retries: 3
+
+  data-manager:
+    build: .
+    command: uv run python data/manager.py
+    ports:
+      - "7862:7862"
+
+  client-1:
+    build: .
+    command: uv run python client/main.py --port 7861 --client-id client_0
+    ports:
+      - "7861:7861"
+    depends_on:
+      server:
+        condition: service_healthy
+
+  client-2:
+    build: .
+    command: uv run python client/main.py --port 7861 --client-id client_1
+    ports:
+      - "7863:7861"
+    depends_on:
+      server:
+        condition: service_healthy
