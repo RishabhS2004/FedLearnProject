@@ -7,7 +7,8 @@ A federated learning system for classifying radio signal modulations using Radio
 ## Quick Start
 
 ```bash
-git clone <repo-url> && cd RadioFed
+git clone https://github.com/0xBinayak/RadioFed.git && cd RadioFed
+
 uv sync
 
 uv run python data/manager.py              # Data Manager  → localhost:7862
