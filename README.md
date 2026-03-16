@@ -1,244 +1,227 @@
-# Federated Learning for Analog Modulation Classification
+# RadioFed
 
-A federated learning system for automatic modulation classification (AMC) using K-Nearest Neighbors on RadioML 2016.10a dataset. Supports distributed training across multiple clients with automatic aggregation and real-time monitoring..
+**Byzantine-Resilient Federated Learning for Automatic Modulation Classification**
 
-## Features
+A production-grade federated learning system for classifying radio signal modulations using RadioML datasets. Features 8 ML classifiers, 3 feature extraction modes (8D/16D/24D), Byzantine fault tolerance, Manim animations, and 4 independent web services.
 
-- **KNN-Only Architecture**: Simplified ML approach using scikit-learn's KNeighborsClassifier
-- **Feature Extraction**: 8 instantaneous features (amplitude + frequency statistics) from I/Q signals
-- **Federated Aggregation**: Merges training data from multiple clients to create global model
-- **Auto-Aggregation**: Automatic model aggregation when threshold is met (default: 2 clients)
-- **Real-Time Dashboard**: Live monitoring with accuracy trends, confusion matrices, and performance metrics
-- **Per-SNR Analysis**: Accuracy breakdown from -20 to 18 dB
+---
+
+## Quick Start
+
+```bash
+# 1. Setup
+git clone <repo-url> && cd RadioFed
+uv venv .venv && uv pip install -e .
+
+# 2. Download & partition dataset
+python data/manager.py              # opens http://localhost:7862
+# → Click "Download via Kaggle" on RadioML 2016.10a
+# → Set clients=4, click "Partition"
+
+# 3. Start server + dashboard
+python central/main.py
+# → API: http://localhost:8000  |  Dashboard: http://localhost:7860
+
+# 4. Start client (separate terminal)
+python client/main.py --port 7861
+# → Client UI: http://localhost:7861
+```
+
+---
+
+## Services
+
+| Service | Port | Command | Purpose |
+|---------|------|---------|---------|
+| **Data Manager** | 7862 | `python data/manager.py` | Download datasets, create partitions |
+| **Central Server** | 8000 + 7860 | `python central/main.py` | REST API + monitoring dashboard |
+| **Client** | 7861 | `python client/main.py` | Train models, extract features, sync |
+
+Run order: Data Manager first (one-time setup), then Central Server, then one or more Clients.
+
+---
+
+## Dataset Setup
+
+### Supported Datasets
+
+| Dataset | Modulations | SNR Range | Format | Samples/key |
+|---------|------------|-----------|--------|-------------|
+| **RadioML 2016.10a** | 11 (8PSK, AM-DSB, AM-SSB, BPSK, CPFSK, GFSK, PAM4, QAM16, QAM64, QPSK, WBFM) | -20 to +18 dB | pickle | 1,000 |
+| **RadioML 2018.01A** | 24 (OOK, ASK4, ASK8, BPSK, QPSK, PSK8, PSK16, PSK32, APSK16, APSK32, APSK64, APSK128, QAM16, QAM32, QAM64, QAM128, QAM256, AM-SSB-WC, AM-SSB-SC, AM-DSB-WC, AM-DSB-SC, FM, GMSK, OQPSK) | -20 to +30 dB | HDF5 | 4,096 |
+
+### Download & Partition (via Data Manager UI)
+
+1. `python data/manager.py` — opens http://localhost:7862
+2. Click **Download via Kaggle** on the dataset you want
+3. Choose number of clients and filter mode (all / analog only)
+4. Click **Partition** — creates `data/partitions/{dataset}/client_N.pkl`
+
+### Download & Partition (CLI)
+
+```bash
+# Kaggle CLI setup (one-time)
+pip install kaggle
+# Place API key at ~/.kaggle/kaggle.json
+
+# Download
+kaggle datasets download -d nolasthitnotomorrow/radioml2016-deepsigcom -p data/ --unzip
+
+# Partition
+python data/partition_dataset.py --input data/RML2016.10a_dict.pkl --num-clients 4
+```
+
+### Download & Partition (Python)
+
+```python
+from data.datasets import download_dataset, partition_dataset
+
+download_dataset("rml2016.10a")
+partition_dataset("rml2016.10a", num_clients=4, filter_mode="all")
+partition_dataset("rml2016.10a", num_clients=6, filter_mode="analog")
+```
+
+---
 
 ## Architecture
 
-### Client Side
-
-**Feature Extraction** (`client/train.py`):
-```python
-def extract_analog_features(signal, fs=128):
-    """ Extracts 8 features from I/Q signals:
-        Amplitude: mean, variance, skewness, kurtosis
-        Frequency: mean, variance, skewness, kurtosis"""
+```
+                    ┌──────────────────────┐
+                    │  Data Manager (:7862) │
+                    │  Download & partition │
+                    └──────────┬───────────┘
+                               │ creates data/partitions/
+        ┌──────────┬───────────┼───────────┬──────────┐
+        ▼          ▼           ▼           ▼          ▼
+   ┌─────────┐┌─────────┐┌─────────┐┌─────────┐
+   │Client 1 ││Client 2 ││Client 3 ││Client 4 │
+   │ :7861   ││ :7863   ││ :7865   ││(Byzant.)│
+   └────┬────┘└────┬────┘└────┬────┘└────┬────┘
+        │          │          │          │
+        └──────────┴────┬─────┴──────────┘
+                        ▼
+   ┌─────────────────────────────────────────────┐
+   │         Central Server (:8000)               │
+   │  Byzantine: Krum → Trust → Anomaly → Cosine │
+   │  Aggregate honest → Global Model             │
+   ├─────────────────────────────────────────────┤
+   │         Dashboard (:7860)                    │
+   │  Overview · Clients · Byzantine · Metrics    │
+   │  How It Works (Manim animations)             │
+   └─────────────────────────────────────────────┘
 ```
 
-**KNN Training**:
-- Uses `sklearn.neighbors.KNeighborsClassifier`
-- Default: `n_neighbors=5`, `test_split=0.3`
-- Measures training time and inference time
-- Generates confusion matrix
+## Feature Extraction
 
-### Server Side
+Three modes (selectable in Client UI → Features tab):
 
-**Aggregation** (`central/aggregator.py`):
-- Merges training data from all clients
-- Retrains global KNN on combined dataset
-- Evaluates with per-SNR accuracy breakdown
+| Mode | Dim | Features |
+|------|-----|----------|
+| **8D** Analog | 8 | Instantaneous amplitude & frequency statistics |
+| **16D** Traditional | 16 | I/Q stats + FFT spectral + zero-crossing rate + energy |
+| **24D** Extended | 24 | 16D + higher-order cumulants (C20, C21, C40, C42) + crest factor + max/min ratio + phase std + phase entropy |
 
-**API Endpoints**:
-- `POST /register/{client_id}` - Register client
-- `POST /upload_model/{client_id}` - Upload KNN model + features + labels
-- `POST /aggregate` - Trigger aggregation
-- `GET /global_model` - Download global model
-- `GET /status` - Server status
+## ML Models
 
-## Configuration
+8 classifiers with hyperparameter tuning (Client UI → Training tab):
 
-Edit `central/config.json`:
+| Model | Type | Key Parameters |
+|-------|------|---------------|
+| KNN | Instance-based | k, weights (uniform/distance) |
+| Decision Tree | Tree-based | max_depth, min_samples_split |
+| Random Forest | Ensemble (bagging) | n_estimators, max_depth |
+| Gradient Boosting | Ensemble (boosting) | n_estimators, learning_rate, max_depth |
+| SVM | Kernel-based | kernel (rbf/linear/poly), C |
+| Logistic Regression | Linear | C, max_iter |
+| Naive Bayes | Probabilistic | Gaussian prior |
+| MLP Neural Network | Neural network | hidden_layers, max_iter |
 
-```json
-{
-  "model_save_path": "./central/model_store/global_knn_model.pkl",
-  "host": "0.0.0.0",
-  "port": 8000,
-  "log_level": "INFO",
-  "auto_aggregation_enabled": true,
-  "auto_aggregation_threshold": 2
-}
-```
+Metrics: Accuracy, Precision, Recall, F1, Cohen's Kappa, training time, inference time.
 
-## Dataset
+## Byzantine Fault Tolerance
 
-**RadioML 2016.10a** - Analog modulations only:
-- **AM**: AM-DSB + AM-SSB (combined)
-- **FM**: WBFM
-- **SNR Range**: -20 to 18 dB (2 dB steps)
-- **Samples**: 128 I/Q samples per signal
+Multi-layer defense (configured in `central/config.json`):
 
-## Performance
-
-**KNN Model**:
-- Training time: ~1-2 seconds
-- Inference time: ~1-2 ms/sample
-- Accuracy (typical):
-  - High SNR (>10 dB): 90-95%
-  - Medium SNR (0-10 dB): 70-85%
-  - Low SNR (<0 dB): 50-70%
+1. **Trust filtering** — exclude clients below trust threshold (0.3)
+2. **Anomaly detection** — z-score on feature/label distributions
+3. **Krum selection** — geometric median filtering
+4. **Cosine filtering** — reject updates dissimilar to median
+5. **Trust updates** — honest clients gain trust, malicious lose it
 
 ## Project Structure
 
 ```
-.
-├── client/
-│   ├── main.py              # Client Gradio UI
-│   ├── train.py             # KNN training + feature extraction
-│   ├── dataset_loader.py    # Dataset loading
-│   ├── feature_extract.py   # Feature processing
-│   └── sync.py              # Server communication
-├── central/
-│   ├── main.py              # Server entry point
-│   ├── server.py            # FastAPI endpoints
-│   ├── aggregator.py        # KNN aggregation logic
-│   ├── dashboard.py         # Gradio dashboard
-│   ├── visualization.py     # Plotting functions
-│   └── state.py             # State management
-├── partition_dataset.py     # Dataset partitioning
-└── pyproject.toml          # Dependencies
-```
-## Technical Details
-
-### Feature Extraction
-
-From each 128-sample I/Q signal:
-1. Compute instantaneous amplitude: `|I + jQ|`
-2. Compute instantaneous phase: `unwrap(angle(I + jQ))`
-3. Compute instantaneous frequency: `diff(phase) / (2π) * fs`
-4. Extract statistics: mean, variance, skewness, kurtosis
-
-### Aggregation Strategy
-
-1. Collect training data (features + labels) from all clients
-2. Merge into single dataset
-3. Train global KNN on combined data
-4. Evaluate on test split (20%)
-5. Compute per-SNR accuracy
-6. Distribute global model to clients
-
-### Model Format
-
-- **Model**: Pickled `sklearn.neighbors.KNeighborsClassifier`
-- **Features**: Pickled numpy array (n_samples, 8)
-- **Labels**: Pickled numpy array (n_samples,)
-
-
-## Quick Start
-
-### Install Dependencies
-
-```bash
-pip install uv
-```
-```bash
-uv sync
+RadioFed/
+├── central/                 # Server + dashboard
+│   ├── main.py             # Launcher (API :8000 + Dashboard :7860)
+│   ├── server.py           # FastAPI REST endpoints
+│   ├── dashboard_app.py    # FastHTML dashboard
+│   ├── aggregator.py       # KNN/DT aggregation + Byzantine
+│   ├── byzantine.py        # Trust, Krum, anomaly detection
+│   ├── state.py            # Thread-safe state management
+│   └── config.json
+├── client/                  # Client UI
+│   ├── main.py             # Launcher (:7861)
+│   ├── app.py              # FastHTML client interface
+│   ├── train.py            # 8 ML trainers
+│   ├── feature_extract.py  # 8D/16D/24D extraction
+│   ├── dataset_loader.py   # RadioML loader
+│   ├── sync.py             # Server communication
+│   └── state.py            # Config/metrics persistence
+├── data/                    # Data management
+│   ├── manager.py          # Standalone Data Manager (:7862)
+│   ├── datasets.py         # Download, load, partition logic
+│   └── partition_dataset.py # CLI partitioning tool
+├── animations/              # Manim scenes
+│   ├── fl_scenes.py        # 1080p hero animations
+│   └── fl_scenes_small.py  # 360p card animations
+├── static/videos/           # Rendered manim videos
+├── tests/                   # 70+ pytest tests
+├── amc-rml2016a-updated.ipynb  # Research notebook
+├── pyproject.toml
+└── readme.md
 ```
 
-###  Partition Dataset 
-(for simulation)
+## API Endpoints
 
-#### Download unzip Dataset 
-```bash
-cd data
-```
-```bash
-curl -L -o ./radioml2016-deepsigcom.zip \
-  https://www.kaggle.com/api/v1/datasets/download/nolasthitnotomorrow/radioml2016-deepsigcom
-````
-```bash
-unzip ./radioml2016-deepsigcom.zip -d ./
-````
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/register/{client_id}` | POST | Register client + initialize trust |
+| `/upload_model/{client_id}` | POST | Upload model + features + labels |
+| `/aggregate` | POST | Manual aggregation trigger |
+| `/global_model` | GET | Download global model |
+| `/trust_scores` | GET | All client trust scores |
+| `/trust_history/{client_id}` | GET | Trust history for a client |
+| `/byzantine_report` | GET | Latest defense report |
+| `/byzantine_strategy` | POST | Change defense strategy |
+| `/status` | GET | Server status + registry |
+| `/health` | GET | Health check |
+| `/aggregation_results` | GET | Latest aggregation metrics |
 
+## Tests
 
 ```bash
-uv run  data/partition_dataset.py
-```
-
-Creates balanced partitions for federated learning from RadioML 2016.10a dataset.
-
-###  Run Tests
-```bash
-uv run pytest tests
+python -m pytest tests/ -v    # 70 tests
 ```
 
-### Start Central Server
+Covers: Byzantine defense, feature extraction, dataset loading, integration, dashboard metrics.
+
+## Manim Animations
+
+5 pre-rendered animations displayed in Dashboard → How It Works:
 
 ```bash
-uv run  central/main.py
+# Regenerate hero (1080p)
+manim -qh animations/fl_scenes.py FederatedLearningFlow --media_dir static/manim_out
+cp static/manim_out/videos/fl_scenes/1080p60/*.mp4 static/videos/
+
+# Regenerate cards (360p, crisp at small size)
+for s in SignalClassification ByzantineDetection AggregationProcess TrustEvolution; do
+  manim -qh animations/fl_scenes_small.py $s --media_dir static/manim_out_sm
+done
+cp static/manim_out_sm/videos/fl_scenes_small/1080p60/*.mp4 static/videos/
 ```
 
-Server runs on `http://localhost:8000` with dashboard at `http://localhost:7860`
+## Tech Stack
 
-###  Start Clients
-
-```bash
-uv run client/main.py --port 7861 --auto-id
-```
-```bash
-uv run client/main.py --port 7862 --auto-id
-```
-```bash
-uv run client/main.py --port 7863 --auto-id
-
-
-```
-
-###  Train on Each Client
-
-1. Open client UI (e.g., `http://localhost:7861`)
-2. Click "Load Partition"
-3. Click "Extract Features" (wait 1-3 minutes)
-4. Click "Train Model" (auto-uploads when complete)
-
-###  View Results
-
-Open dashboard at `http://localhost:7860` to see:
-- Real-time accuracy trends
-- Confusion matrices
-- Per-SNR performance
-- Client status and metrics
-
-
-
-
-
-
-## API Usage
-
-### Upload Model
-
-```bash
-curl -X POST "http://localhost:8000/upload_model/client1?n_samples=1000" \
-  -F "model_file=@model.pkl" \
-  -F "features_file=@features.pkl" \
-  -F "labels_file=@labels.pkl"
-```
-
-### Trigger Aggregation
-
-```bash
-curl -X POST "http://localhost:8000/aggregate"
-```
-
-### Download Global Model
-
-```bash
-curl -O "http://localhost:8000/global_model"
-```
-
-## Dashboard Metrics
-
-- **System Status**: Server health, connected clients, current round
-- **Accuracy Trends**: Historical before/after aggregation performance
-- **Confusion Matrix**: KNN classification results
-- **Accuracy vs SNR**: Performance across signal-to-noise ratios
-- **Complexity**: Training and inference time metrics
-
-
-
-## License
-
-MIT License - See LICENSE file for details
-
-## Citation
-
-Based on RadioML 2016.10a dataset and federated learning principles. ML approach adapted from `amc-rml2016a-updated.
+FastHTML + HTMX | FastAPI + Uvicorn | scikit-learn | Manim | Matplotlib + Seaborn | uv

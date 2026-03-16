@@ -1,9 +1,9 @@
 """
 FastAPI Server for Federated Learning Central Server
 
-This module provides REST API endpoints for client communication including
-model upload, aggregation triggering, global model download, and status queries.
-Supports KNN models only.
+REST API endpoints for client communication including model upload,
+Byzantine-resilient aggregation, global model download, trust scores,
+and status queries. Supports KNN and Decision Tree models.
 """
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Query
@@ -34,23 +34,33 @@ from central.state import (
 )
 from central.aggregator import (
     aggregate_knn_models,
+    aggregate_dt_models,
     save_knn_model,
+    save_dt_model,
     evaluate_global_model
+)
+from central.byzantine import (
+    get_all_trust_scores,
+    get_trust_score,
+    get_trust_history,
+    get_byzantine_aggregator,
+    set_byzantine_strategy,
+    initialize_trust
 )
 from central.utils import setup_logging, ensure_directories
 
 
 # Initialize FastAPI app
 app = FastAPI(
-    title="Federated Learning Central Server",
-    description="REST API for federated learning KNN model aggregation and distribution",
-    version="1.0.0"
+    title="RadioFed Central Server",
+    description="Byzantine-Resilient Federated Learning for Automatic Modulation Classification",
+    version="2.0.0"
 )
 
-# Add CORS middleware for Gradio UI communication
+# CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins for Gradio
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -69,14 +79,12 @@ _aggregation_lock = threading.Lock()
 def _initialize_server():
     """Initialize server configuration and logging."""
     global logger, config
-    
+
     if logger is not None and config is not None:
-        return  # Already initialized
-    
-    # Ensure directories exist
+        return
+
     ensure_directories()
-    
-    # Load configuration
+
     try:
         config = load_config()
         log_level = config.get("log_level", "INFO")
@@ -91,224 +99,177 @@ def _initialize_server():
             "auto_aggregation_threshold": 2
         }
         log_level = "INFO"
-    
-    # Setup logging
+
     logger = setup_logging(log_level)
-    logger.info("Central server starting up")
-    logger.info(f"Configuration: {config}")
-    
-    # Initialize auto-aggregation state from configuration
+    logger.info("RadioFed Central Server starting up")
+
     try:
         initialize_auto_aggregation_state()
-        logger.info("Auto-aggregation state initialized from configuration")
     except ValueError as e:
         logger.error(f"Configuration validation failed: {e}")
         raise
     except Exception as e:
         logger.warning(f"Could not initialize auto-aggregation state: {e}")
-    
-    # Initialize metrics history
+
     try:
         initialize_metrics_history()
-        logger.info("Metrics history initialized")
     except Exception as e:
         logger.warning(f"Could not initialize metrics history: {e}")
 
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialize server on startup."""
     _initialize_server()
 
 
 def perform_auto_aggregation():
-    """
-    Execute complete auto-aggregation workflow in background thread.
-    
-    This function is called asynchronously when auto-aggregation is triggered.
-    It performs the following steps:
-    1. Capture before-aggregation metrics
-    2. Perform KNN aggregation
-    3. Evaluate global model after aggregation
-    4. Store round in metrics history
-    5. Reset aggregation state
-    6. Broadcast global model to clients (models are saved and available for download)
-    """
+    """Execute complete auto-aggregation workflow with Byzantine filtering."""
     global _aggregation_in_progress, last_aggregation_time
-    
+
     try:
         logger.info("Starting auto-aggregation workflow...")
-        
-        # Step 1: Capture before-aggregation metrics
-        logger.info("Capturing before-aggregation metrics...")
+
+        # Capture before-aggregation metrics
         try:
             from central.state import capture_current_metrics
             before_metrics = capture_current_metrics()
-            logger.info(f"Before-aggregation metrics captured: KNN={before_metrics.get('knn_accuracy', 0):.4f}")
         except Exception as e:
-            logger.warning(f"Could not capture before-aggregation metrics: {e}")
+            logger.warning(f"Could not capture before-metrics: {e}")
             before_metrics = {
-                'knn_accuracy': 0.0,
-                'per_snr_accuracy': {},
-                'confusion_matrix': [],
-                'num_clients': 0,
+                'knn_accuracy': 0.0, 'per_snr_accuracy': {},
+                'confusion_matrix': [], 'num_clients': 0,
                 'timestamp': datetime.now().isoformat()
             }
-        
-        # Step 2: Get all client weights and perform aggregation
+
+        # Get all client data
         client_weights_info = get_all_client_weights()
-        
         if not client_weights_info:
-            logger.warning("No client models available for auto-aggregation")
+            logger.warning("No client models available")
             return
-        
-        # Filter for KNN models only
+
         knn_clients = [c for c in client_weights_info if c.get('model_type', 'knn') == 'knn']
-        
-        if not knn_clients:
-            logger.warning("No KNN models available for auto-aggregation")
-            return
-        
-        try:
-            logger.info(f"Aggregating KNN models from {len(knn_clients)} clients")
-            
-            # KNN aggregation
-            result = aggregate_knn_models(knn_clients, n_neighbors=5, evaluate=True)
-            
-            # Save global KNN model
-            global_knn_path = "./central/model_store/global_knn_model.pkl"
-            save_knn_model(result['global_model'], global_knn_path)
-            
-            timestamp = datetime.now().isoformat()
-            store_aggregation_result('knn', result, timestamp)
-            
-            logger.info(f"KNN aggregation completed: {result['num_clients']} clients, accuracy={result.get('accuracy', 0.0):.4f}")
-        
-        except Exception as e:
-            logger.error(f"Error aggregating KNN models: {e}")
-            return
-        
-        # Step 3: Evaluate global model after aggregation
-        logger.info("Evaluating global model after aggregation...")
+        timestamp = datetime.now().isoformat()
+
+        # KNN aggregation with Byzantine filtering
+        if knn_clients:
+            try:
+                result = aggregate_knn_models(
+                    knn_clients, n_neighbors=5, evaluate=True,
+                    byzantine_filtering=True
+                )
+                save_knn_model(result['global_model'],
+                             "./central/model_store/global_knn_model.pkl")
+                store_aggregation_result('knn', result, timestamp)
+                logger.info(f"KNN aggregation: {result['num_clients']} clients, "
+                          f"accuracy={result.get('accuracy', 0):.4f}")
+
+                if result.get('defense_report'):
+                    report = result['defense_report']
+                    logger.info(f"Byzantine: {report['accepted_count']}/{report['total_clients']} accepted")
+            except Exception as e:
+                logger.error(f"KNN aggregation error: {e}")
+
+        # DT aggregation with Byzantine filtering
+        dt_clients = [c for c in client_weights_info if c.get('model_type') == 'dt']
+        if dt_clients:
+            try:
+                result = aggregate_dt_models(
+                    dt_clients, evaluate=True, byzantine_filtering=True
+                )
+                save_dt_model(result['global_model'],
+                            "./central/model_store/global_dt_model.pkl")
+                store_aggregation_result('dt', result, timestamp)
+                logger.info(f"DT aggregation: accuracy={result.get('accuracy', 0):.4f}")
+            except Exception as e:
+                logger.error(f"DT aggregation error: {e}")
+
+        # Evaluate and store round metrics
         try:
             from central.state import evaluate_global_model as eval_global
             after_metrics = eval_global()
-            logger.info(f"After-aggregation metrics captured: KNN={after_metrics.get('knn_accuracy', 0):.4f}")
-        except Exception as e:
-            logger.warning(f"Could not evaluate global model: {e}")
+        except Exception:
             after_metrics = {
-                'knn_accuracy': 0.0,
-                'per_snr_accuracy': {},
-                'confusion_matrix': [],
-                'timestamp': datetime.now().isoformat()
+                'knn_accuracy': 0.0, 'per_snr_accuracy': {},
+                'confusion_matrix': [], 'timestamp': datetime.now().isoformat()
             }
-        
-        # Step 4: Store round in metrics history
-        logger.info("Storing aggregation round in metrics history...")
+
         try:
             from central.state import store_aggregation_round
             store_aggregation_round(before_metrics, after_metrics)
-            logger.info("Metrics history updated successfully")
         except Exception as e:
-            logger.error(f"Failed to store metrics history: {e}")
-        
-        # Step 5: Reset aggregation state
-        logger.info("Resetting aggregation state...")
+            logger.error(f"Failed to store metrics: {e}")
+
         try:
             from central.state import reset_aggregation_state, get_auto_aggregation_state
             reset_aggregation_state()
-            state = get_auto_aggregation_state()
-            logger.info(f"Aggregation state reset. New round: {state['current_round']}")
         except Exception as e:
-            logger.error(f"Failed to reset aggregation state: {e}")
-        
-        # Update last aggregation time
+            logger.error(f"Failed to reset state: {e}")
+
         last_aggregation_time = datetime.now().isoformat()
-        
-        # Step 6: Global models are already saved and available for client download
-        logger.info("Auto-aggregation workflow completed successfully. Global models available for download.")
-    
+        logger.info("Auto-aggregation workflow completed.")
+
     except Exception as e:
-        logger.error(f"Auto-aggregation workflow failed: {e}", exc_info=True)
-    
+        logger.error(f"Auto-aggregation failed: {e}", exc_info=True)
     finally:
-        # Reset aggregation in progress flag to allow future aggregation attempts
         with _aggregation_lock:
             global _aggregation_in_progress
             _aggregation_in_progress = False
 
 
 def trigger_aggregation_async():
-    """
-    Trigger aggregation in a background thread.
-    
-    Prevents concurrent aggregations by checking if one is already in progress.
-    Launches aggregation in a separate thread to avoid blocking client uploads.
-    """
+    """Trigger aggregation in background thread."""
     global _aggregation_in_progress
-    
+
     with _aggregation_lock:
         if _aggregation_in_progress:
-            logger.info("Aggregation already in progress, skipping trigger")
+            logger.info("Aggregation already in progress")
             return
-        
-        # Set flag to prevent concurrent aggregations
         _aggregation_in_progress = True
-    
-    # Launch aggregation in background thread
+
     thread = threading.Thread(target=perform_auto_aggregation, daemon=True)
     thread.start()
-    
-    logger.info("Auto-aggregation triggered in background thread")
 
+
+# ─── API Endpoints ────────────────────────────────────────────────────────────
 
 @app.get("/")
 async def root():
-    """Root endpoint with API information."""
     return {
-        "message": "Federated Learning Central Server - KNN Only",
-        "version": "1.0.0",
+        "message": "RadioFed Central Server - Byzantine-Resilient FL for AMC",
+        "version": "2.0.0",
+        "features": ["KNN", "Decision Tree", "Byzantine Fault Tolerance",
+                     "Trust Scoring", "Krum Selection"],
         "endpoints": {
             "register": "POST /register/{client_id}",
             "training_status": "POST /training_status/{client_id}?training={bool}",
-            "upload_model": "POST /upload_model/{client_id}?n_samples={count}",
+            "upload_model": "POST /upload_model/{client_id}",
             "aggregate": "POST /aggregate",
             "global_model": "GET /global_model",
             "aggregation_results": "GET /aggregation_results",
-            "status": "GET /status"
+            "trust_scores": "GET /trust_scores",
+            "byzantine_report": "GET /byzantine_report",
+            "status": "GET /status",
+            "health": "GET /health"
         }
     }
 
 
 @app.post("/register/{client_id}")
 async def register_client(client_id: str):
-    """
-    Register a client connection with the server.
-    
-    Args:
-        client_id: Unique identifier for the client
-    
-    Returns:
-        JSON response with registration status
-    """
     _initialize_server()
-    
     try:
-        if not client_id or len(client_id.strip()) == 0:
+        if not client_id or not client_id.strip():
             raise HTTPException(status_code=400, detail="Invalid client_id")
-        
+
         register_client_connection(client_id)
+        initialize_trust(client_id)
         logger.info(f"Client registered: {client_id}")
-        
-        return JSONResponse(
-            status_code=200,
-            content={
-                "status": "success",
-                "client_id": client_id,
-                "message": f"Client {client_id} registered successfully",
-                "timestamp": datetime.now().isoformat()
-            }
-        )
+
+        return JSONResponse(status_code=200, content={
+            "status": "success", "client_id": client_id,
+            "trust_score": get_trust_score(client_id),
+            "timestamp": datetime.now().isoformat()
+        })
     except Exception as e:
         logger.error(f"Error registering client {client_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -319,342 +280,251 @@ async def update_training_status(
     client_id: str,
     training: bool = Query(..., description="Whether client is training")
 ):
-    """
-    Update client training status.
-    
-    Args:
-        client_id: Unique identifier for the client
-        training: Whether client is currently training
-    
-    Returns:
-        JSON response with status update
-    """
     _initialize_server()
-    
     try:
-        if not client_id or len(client_id.strip()) == 0:
+        if not client_id or not client_id.strip():
             raise HTTPException(status_code=400, detail="Invalid client_id")
-        
         update_client_training_status(client_id, training)
-        status_text = "training" if training else "idle"
-        logger.info(f"Client {client_id} status updated: {status_text}")
-        
-        return JSONResponse(
-            status_code=200,
-            content={
-                "status": "success",
-                "client_id": client_id,
-                "training": training,
-                "timestamp": datetime.now().isoformat()
-            }
-        )
+        return JSONResponse(status_code=200, content={
+            "status": "success", "client_id": client_id,
+            "training": training, "timestamp": datetime.now().isoformat()
+        })
     except Exception as e:
-        logger.error(f"Error updating training status for {client_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/upload_model/{client_id}")
 async def upload_model(
     client_id: str,
-    n_samples: int = Query(..., description="Number of samples used for training"),
-    model_file: UploadFile = File(..., description="Serialized KNN model file (.pkl format)"),
-    features_file: UploadFile = File(..., description="Training features file (.pkl format)"),
-    labels_file: UploadFile = File(..., description="Training labels file (.pkl format)")
+    n_samples: int = Query(..., description="Number of training samples"),
+    model_file: UploadFile = File(...),
+    features_file: UploadFile = File(...),
+    labels_file: UploadFile = File(...)
 ):
-    """
-    Upload KNN model to the central server.
-    
-    Args:
-        client_id: Unique identifier for the client
-        n_samples: Number of samples used for training
-        model_file: Serialized model file
-        features_file: Training features (required for KNN aggregation)
-        labels_file: Training labels (required for KNN aggregation)
-    
-    Returns:
-        JSON response with upload status
-    """
     _initialize_server()
-    
     try:
-        # Validate inputs
-        if not client_id or len(client_id.strip()) == 0:
+        if not client_id or not client_id.strip():
             raise HTTPException(status_code=400, detail="Invalid client_id")
-        
         if n_samples <= 0:
             raise HTTPException(status_code=400, detail="n_samples must be positive")
-        
-        # Create storage directory
+
         models_dir = "./central/model_store"
         os.makedirs(models_dir, exist_ok=True)
-        
-        # Save model file
+
+        # Save uploaded files
         model_path = os.path.join(models_dir, f"{client_id}_knn_model.pkl")
-        model_contents = await model_file.read()
         with open(model_path, "wb") as f:
-            f.write(model_contents)
-        
-        logger.info(f"Received KNN model from {client_id}: {len(model_contents)} bytes")
-        
-        # Save features
+            f.write(await model_file.read())
+
         features_path = os.path.join(models_dir, f"{client_id}_features.pkl")
-        features_contents = await features_file.read()
         with open(features_path, "wb") as f:
-            f.write(features_contents)
-        logger.info(f"Received features from {client_id}: {len(features_contents)} bytes")
-        
-        # Save labels
+            f.write(await features_file.read())
+
         labels_path = os.path.join(models_dir, f"{client_id}_labels.pkl")
-        labels_contents = await labels_file.read()
         with open(labels_path, "wb") as f:
-            f.write(labels_contents)
-        logger.info(f"Received labels from {client_id}: {len(labels_contents)} bytes")
-        
-        # Register client upload
+            f.write(await labels_file.read())
+
+        # Register upload
         register_client_upload(
-            client_id=client_id,
-            n_samples=n_samples,
-            weights_path=model_path,
-            model_type='knn',
-            model_path=model_path,
-            features_path=features_path,
+            client_id=client_id, n_samples=n_samples,
+            weights_path=model_path, model_type='knn',
+            model_path=model_path, features_path=features_path,
             labels_path=labels_path
         )
-        
-        # Track upload for auto-aggregation
+
+        initialize_trust(client_id)
         track_client_upload(client_id)
-        
-        # Get upload tracking info
-        pending_uploads = get_pending_uploads_count()
+
+        pending = get_pending_uploads_count()
         threshold = get_auto_aggregation_threshold()
-        
-        logger.info(f"Upload tracked for {client_id}: {pending_uploads}/{threshold} clients uploaded")
-        
-        # Check if auto-aggregation should be triggered
+
+        logger.info(f"Upload from {client_id}: {pending}/{threshold}")
+
         if should_trigger_aggregation():
-            logger.info(f"Auto-aggregation threshold reached: {pending_uploads}/{threshold} clients")
             trigger_aggregation_async()
-        
-        # Get stats
-        stats = get_registry_stats()
-        
-        return JSONResponse(
-            status_code=200,
-            content={
-                "status": "success",
-                "client_id": client_id,
-                "model_type": "knn",
-                "n_samples": n_samples,
-                "timestamp": datetime.now().isoformat(),
-                "message": f"KNN model uploaded successfully from {client_id}",
-                "total_clients": stats['total_clients'],
-                "total_samples": stats['total_samples'],
-                "upload_status": {
-                    "pending_uploads": pending_uploads,
-                    "threshold": threshold,
-                    "ready_for_aggregation": pending_uploads >= threshold
-                }
+
+        return JSONResponse(status_code=200, content={
+            "status": "success", "client_id": client_id,
+            "model_type": "knn", "n_samples": n_samples,
+            "trust_score": get_trust_score(client_id),
+            "timestamp": datetime.now().isoformat(),
+            "upload_status": {
+                "pending_uploads": pending,
+                "threshold": threshold,
+                "ready_for_aggregation": pending >= threshold
             }
-        )
-    
+        })
+
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error uploading model from {client_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        logger.error(f"Upload error from {client_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/aggregate")
 async def aggregate():
-    """
-    Trigger aggregation of uploaded KNN models.
-    
-    Returns:
-        JSON response with aggregation results
-    """
     _initialize_server()
     global last_aggregation_time
-    
+
     try:
-        # Get all client info from registry
         client_weights_info = get_all_client_weights()
-        
         if not client_weights_info:
-            raise HTTPException(
-                status_code=400,
-                detail="No client models available for aggregation"
-            )
-        
-        # Filter for KNN models
+            raise HTTPException(status_code=400, detail="No client models available")
+
         knn_clients = [c for c in client_weights_info if c.get('model_type', 'knn') == 'knn']
-        
         if not knn_clients:
-            raise HTTPException(
-                status_code=400,
-                detail="No KNN models available for aggregation"
-            )
-        
-        logger.info(f"Starting KNN aggregation with {len(knn_clients)} clients")
-        
+            raise HTTPException(status_code=400, detail="No KNN models available")
+
         timestamp = datetime.now().isoformat()
-        
-        # KNN aggregation - merge data and retrain with evaluation
-        result = aggregate_knn_models(knn_clients, n_neighbors=5, evaluate=True)
-        
-        # Save global KNN model
-        global_knn_path = "./central/model_store/global_knn_model.pkl"
-        save_knn_model(result['global_model'], global_knn_path)
-        
-        # Store result with metrics
+        result = aggregate_knn_models(knn_clients, n_neighbors=5, evaluate=True,
+                                     byzantine_filtering=True)
+        save_knn_model(result['global_model'], "./central/model_store/global_knn_model.pkl")
         store_aggregation_result('knn', result, timestamp)
-        
-        response_content = {
-            "status": "success",
-            "model_type": "knn",
+
+        last_aggregation_time = timestamp
+
+        response = {
+            "status": "success", "model_type": "knn",
             "num_clients": result['num_clients'],
             "total_samples": result['total_samples'],
-            "feature_dim": result['feature_dim'],
-            "n_neighbors": result['n_neighbors'],
             "accuracy": result.get('accuracy', 0.0),
-            "training_time": result.get('training_time', 0.0),
-            "inference_time_ms": result.get('inference_time_ms_per_sample', 0.0),
-            "global_model_path": global_knn_path,
-            "timestamp": timestamp,
-            "message": "KNN aggregation completed successfully"
+            "trust_scores": result.get('trust_scores', {}),
+            "timestamp": timestamp
         }
-        
-        last_aggregation_time = timestamp
-        
-        logger.info(f"KNN aggregation completed: {response_content['num_clients']} clients, {response_content['total_samples']} total samples")
-        
-        return JSONResponse(
-            status_code=200,
-            content=response_content
-        )
-    
+
+        if result.get('defense_report'):
+            response['byzantine_report'] = {
+                'accepted': result['defense_report']['accepted_count'],
+                'rejected': result['defense_report']['rejected_count'],
+                'strategy': result['defense_report']['strategy']
+            }
+
+        return JSONResponse(status_code=200, content=response)
+
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error during KNN aggregation: {e}")
-        raise HTTPException(status_code=500, detail=f"Aggregation failed: {str(e)}")
+        logger.error(f"Aggregation error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/global_model")
 async def get_global_model():
-    """
-    Download the current global KNN model.
-    
-    Returns:
-        FileResponse with the global model file
-    """
     _initialize_server()
-    
     try:
-        global_model_path = "./central/model_store/global_knn_model.pkl"
-        filename = "global_knn_model.pkl"
-        
-        if not os.path.exists(global_model_path):
-            raise HTTPException(
-                status_code=404,
-                detail="Global KNN model not found. Please run aggregation first."
-            )
-        
-        logger.info("Serving global KNN model download")
-        
-        return FileResponse(
-            path=global_model_path,
-            media_type="application/octet-stream",
-            filename=filename
-        )
-    
+        path = "./central/model_store/global_knn_model.pkl"
+        if not os.path.exists(path):
+            raise HTTPException(status_code=404, detail="Global model not found")
+        return FileResponse(path, media_type="application/octet-stream",
+                          filename="global_knn_model.pkl")
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error serving global model: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to serve global model: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/aggregation_results")
 async def get_aggregation_results():
-    """
-    Get aggregation results for KNN models.
-    
-    Returns:
-        JSON response with aggregation results
-    """
     _initialize_server()
-    
     try:
         result = get_latest_aggregation_result('knn')
-        
         if result is None:
-            raise HTTPException(
-                status_code=404,
-                detail="No aggregation results found for KNN models"
-            )
-        
-        # Remove non-serializable objects
-        response_result = {k: v for k, v in result['result'].items() if k != 'global_model'}
-        
-        return JSONResponse(
-            status_code=200,
-            content={
-                "status": "success",
-                "model_type": "knn",
-                "result": response_result,
-                "timestamp": result['timestamp']
-            }
-        )
-    
+            raise HTTPException(status_code=404, detail="No aggregation results found")
+
+        response_result = {k: v for k, v in result['result'].items()
+                         if k not in ('global_model', 'predictions')}
+
+        return JSONResponse(status_code=200, content={
+            "status": "success", "model_type": "knn",
+            "result": response_result, "timestamp": result['timestamp']
+        })
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error getting aggregation results: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to get aggregation results: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/trust_scores")
+async def get_trust_scores_endpoint():
+    """Get all client trust scores."""
+    _initialize_server()
+    scores = get_all_trust_scores()
+    return JSONResponse(status_code=200, content={
+        "trust_scores": scores,
+        "threshold": 0.3,
+        "timestamp": datetime.now().isoformat()
+    })
+
+
+@app.get("/trust_history/{client_id}")
+async def get_trust_history_endpoint(client_id: str):
+    """Get trust score history for a specific client."""
+    _initialize_server()
+    history = get_trust_history(client_id)
+    return JSONResponse(status_code=200, content={
+        "client_id": client_id,
+        "current_score": get_trust_score(client_id),
+        "history": history
+    })
+
+
+@app.get("/byzantine_report")
+async def get_byzantine_report():
+    """Get latest Byzantine defense report."""
+    _initialize_server()
+    aggregator = get_byzantine_aggregator()
+    log = aggregator.get_aggregation_log()
+
+    return JSONResponse(status_code=200, content={
+        "strategy": aggregator.strategy,
+        "total_rounds": len(log),
+        "latest_report": log[-1] if log else None,
+        "timestamp": datetime.now().isoformat()
+    })
+
+
+@app.post("/byzantine_strategy")
+async def set_strategy(strategy: str = Query(...)):
+    """Set Byzantine defense strategy."""
+    _initialize_server()
+    valid = ['krum', 'trimmed_mean', 'trust_weighted', 'full']
+    if strategy not in valid:
+        raise HTTPException(status_code=400,
+                          detail=f"Invalid strategy. Must be one of: {valid}")
+    set_byzantine_strategy(strategy)
+    return {"status": "success", "strategy": strategy}
 
 
 @app.get("/status")
 async def get_status():
-    """
-    Get server status and client registry information.
-    
-    Returns:
-        JSON response with server health and connected clients
-    """
     _initialize_server()
-    
     try:
-        # Get client status
         clients = get_client_status()
-        
-        # Get registry statistics
         stats = get_registry_stats()
-        
-        # Check if global model exists
-        global_model_path = "./central/model_store/global_knn_model.pkl"
-        global_model_exists = os.path.exists(global_model_path)
-        
-        return JSONResponse(
-            status_code=200,
-            content={
-                "server_status": "running",
-                "timestamp": datetime.now().isoformat(),
-                "last_aggregation": last_aggregation_time,
-                "global_model_exists": global_model_exists,
-                "global_model_path": global_model_path if global_model_exists else None,
-                "total_clients": stats['total_clients'],
-                "total_samples": stats['total_samples'],
-                "clients": clients
-            }
-        )
-    
+        trust_scores = get_all_trust_scores()
+
+        return JSONResponse(status_code=200, content={
+            "server_status": "running",
+            "version": "2.0.0",
+            "timestamp": datetime.now().isoformat(),
+            "last_aggregation": last_aggregation_time,
+            "global_model_exists": os.path.exists("./central/model_store/global_knn_model.pkl"),
+            "total_clients": stats['total_clients'],
+            "total_samples": stats['total_samples'],
+            "trust_scores": trust_scores,
+            "byzantine_strategy": get_byzantine_aggregator().strategy,
+            "clients": clients
+        })
     except Exception as e:
-        logger.error(f"Error getting status: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to get status: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
-# Health check endpoint
 @app.get("/health")
 async def health_check():
-    """Simple health check endpoint."""
-    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
+    return {
+        "status": "healthy",
+        "version": "2.0.0",
+        "byzantine_enabled": True,
+        "timestamp": datetime.now().isoformat()
+    }

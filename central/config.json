@@ -1,8 +1,0 @@
-{
-  "model_save_path": "./central/model_store/global_model.pth",
-  "host": "127.0.0.1",
-  "port": 8000,
-  "log_level": "INFO",
-  "auto_aggregation_enabled": true,
-  "auto_aggregation_threshold": 2
-}

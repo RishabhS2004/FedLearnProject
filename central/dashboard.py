@@ -1,12 +1,13 @@
 """
-Central Dashboard for Federated Learning AMC System
+Central Dashboard for RadioFed - Production-Level Monitoring
 
-This module provides a comprehensive Gradio-based dashboard for monitoring
-federated learning training, visualizing model performance, and tracking
-client status for Automatic Modulation Classification (AMC).
+Comprehensive Gradio dashboard with Byzantine fault tolerance monitoring,
+model comparison, trust scores, and advanced visualizations.
 """
 
 import gradio as gr
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import seaborn as sns
 import pandas as pd
@@ -25,719 +26,602 @@ from central.state import (
     get_latest_round_metrics,
     get_auto_aggregation_state
 )
+from central.byzantine import (
+    get_all_trust_scores,
+    get_trust_history,
+    get_byzantine_aggregator
+)
 
-
-# Configure logging
 logger = logging.getLogger(__name__)
 
 
+# ─── Custom CSS ───────────────────────────────────────────────────────────────
+
+DASHBOARD_CSS = """
+:root {
+    --primary: #6366f1;
+    --accent: #06b6d4;
+    --success: #10b981;
+    --warning: #f59e0b;
+    --danger: #ef4444;
+}
+
+.gradio-container {
+    max-width: 1600px !important;
+    font-family: 'Inter', system-ui, sans-serif !important;
+}
+
+.dashboard-header {
+    background: linear-gradient(135deg, #1e1b4b 0%, #312e81 50%, #4338ca 100%);
+    border-radius: 16px;
+    padding: 24px 32px;
+    margin-bottom: 16px;
+    border: 1px solid rgba(99, 102, 241, 0.3);
+    box-shadow: 0 4px 24px rgba(99, 102, 241, 0.15);
+}
+
+.dashboard-header h1 {
+    background: linear-gradient(135deg, #818cf8, #06b6d4);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    font-size: 2.2em;
+    margin: 0;
+}
+
+.dashboard-header p {
+    color: #94a3b8;
+    margin: 4px 0 0 0;
+}
+
+.stat-card {
+    background: linear-gradient(135deg, rgba(30, 27, 75, 0.9), rgba(49, 46, 129, 0.5));
+    border: 1px solid rgba(99, 102, 241, 0.2);
+    border-radius: 12px;
+    padding: 20px;
+    text-align: center;
+    transition: all 0.3s ease;
+    min-height: 100px;
+}
+
+.stat-card:hover {
+    border-color: rgba(99, 102, 241, 0.5);
+    transform: translateY(-2px);
+    box-shadow: 0 8px 24px rgba(99, 102, 241, 0.15);
+}
+
+.stat-value {
+    font-size: 2.2em;
+    font-weight: 700;
+    line-height: 1;
+}
+
+.stat-label {
+    font-size: 0.85em;
+    color: #94a3b8;
+    margin-top: 8px;
+}
+
+.byzantine-card {
+    background: linear-gradient(135deg, rgba(239, 68, 68, 0.1), rgba(245, 158, 11, 0.05));
+    border: 1px solid rgba(239, 68, 68, 0.2);
+    border-radius: 12px;
+    padding: 16px;
+}
+
+.trust-high { color: #10b981; }
+.trust-medium { color: #f59e0b; }
+.trust-low { color: #ef4444; }
+"""
+
+# ─── Plot Style Config ────────────────────────────────────────────────────────
+
+PLOT_BG = '#0f0f1a'
+PLOT_FACE = '#1e1b4b'
+PLOT_TEXT = '#e2e8f0'
+PLOT_GRID = '#6366f1'
+PLOT_MUTED = '#94a3b8'
+
+
+def _style_ax(ax):
+    """Apply consistent dark style to axes."""
+    ax.set_facecolor(PLOT_FACE)
+    ax.tick_params(colors=PLOT_MUTED)
+    ax.grid(True, alpha=0.15, color=PLOT_GRID)
+    for spine in ax.spines.values():
+        spine.set_color(PLOT_GRID)
+        spine.set_alpha(0.3)
+
+
+# ─── Dashboard State ──────────────────────────────────────────────────────────
+
 class DashboardState:
-    """
-    Dashboard state management class for tracking metrics and visualization data.
-    """
-    
     def __init__(self):
-        """Initialize dashboard state."""
         self.current_round = 0
         self.server_running = True
-        self.last_update = datetime.now()
-        
-        # Metrics storage
-        self.metrics_history = []
-        self.before_aggregation = {}
-        self.after_aggregation = {}
-        self.complexity_metrics = {}
-        
-        # SNR levels for RadioML 2016.10a
-        self.snr_levels = list(range(-20, 20, 2))  # -20 to 18 dB
+        self.snr_levels = list(range(-20, 20, 2))
         self.modulation_classes = ['AM', 'FM']
-        self.num_classes = len(self.modulation_classes)
-    
-    def update_metrics(self, model_type: str, metrics: Dict):
-        """
-        Update metrics for a specific model type.
-        
-        Args:
-            model_type: Type of model ('knn' or 'dt')
-            metrics: Dictionary containing metrics data
-        """
-        self.metrics_history.append({
-            'timestamp': datetime.now().isoformat(),
-            'model_type': model_type,
-            'metrics': metrics
-        })
-        self.last_update = datetime.now()
-    
+        self.num_classes = 2
+
     def get_baseline_accuracy(self) -> float:
-        """
-        Calculate baseline accuracy (random guess).
-        
-        Returns:
-            Baseline accuracy as percentage
-        """
         return 100.0 / self.num_classes
-    
-    def collect_metrics(self) -> Dict:
-        """
-        Collect current metrics from state management.
-        
-        Returns:
-            Dictionary containing current metrics
-        """
-        # Get latest aggregation results (KNN only)
-        knn_result = get_latest_aggregation_result('knn')
-        
-        return {
-            'knn': knn_result,
-            'timestamp': datetime.now().isoformat()
-        }
 
 
-# Global dashboard state instance
 dashboard_state = DashboardState()
 
 
-def create_dashboard_interface() -> gr.Blocks:
-    """
-    Create the main Gradio dashboard interface with all sections.
-    
-    Applies clean UI styling matching notebook aesthetic:
-    - Uses matplotlib default style or seaborn style
-    - Removes emoji from plot titles (keeps in status indicators only)
-    - Organizes plots in 2-column grid layout using gr.Row()
-    - Adds clear section headers with gr.Markdown("## Section Name")
-    - Sets consistent figure sizes: (10, 6) for main plots, (8, 5) for distributions
-    - Uses tight_layout() for all matplotlib figures
-    
-    Returns:
-        Gradio Blocks interface
-    """
-    # Set matplotlib style for clean aesthetic
-    plt.style.use('default')
-    sns.set_palette('viridis')
-    
-    with gr.Blocks(title="AMC Federated Learning Dashboard", theme=gr.themes.Soft()) as dashboard:
-        gr.Markdown("# AMC Federated Learning Dashboard")
-        gr.Markdown("Real-time monitoring and visualization for analog modulation classification")
-        
-        # Auto-refresh timer (2 seconds)
-        timer = gr.Timer(value=2, active=True)
-        
-        # System Status Section
-        gr.Markdown("## System Status")
-        with gr.Row():
-            with gr.Column(scale=1):
-                server_status = gr.Markdown(value="🟢 Server is running")
-                connected_clients = gr.Markdown(value="Connected Clients: 0")
-            with gr.Column(scale=1):
-                current_round = gr.Markdown(value="Training Round: 0")
-                last_aggregation = gr.Markdown(value="Last Aggregation: Never")
-                aggregation_progress = gr.Markdown(value="⏳ Waiting for uploads (0/2 clients)")
-        
-        # Client Monitoring Section
-        gr.Markdown("## Client Monitoring")
-        with gr.Row():
-            with gr.Column():
-                client_table = gr.Dataframe(
-                    headers=["Client ID", "Status", "Last Upload", "Sample Count"],
-                    datatype=["str", "str", "str", "number"],
-                    label="Connected Clients"
-                )
-        
-        # Training Progress Section (NEW)
-        gr.Markdown("## Training Progress")
-        with gr.Row():
-            with gr.Column():
-                historical_trends_plot = gr.Plot(label="Historical Accuracy Trends")
-        
-        # Latest Aggregation Results Section (NEW)
-        gr.Markdown("## Latest Aggregation Results")
-        with gr.Row():
-            with gr.Column():
-                before_after_table = gr.Dataframe(
-                    headers=["Metric", "Before", "After", "Improvement"],
-                    datatype=["str", "str", "str", "str"],
-                    label="Before/After Comparison"
-                )
-        
-        # Training Metrics Comparison Section
-        gr.Markdown("## Training Metrics Comparison")
-        with gr.Row():
-            with gr.Column():
-                metrics_table = gr.Dataframe(
-                    headers=["SNR (dB)", "Baseline Accuracy (%)", "KNN Accuracy (%)"],
-                    datatype=["number", "number", "number"],
-                    label="Accuracy by SNR Level"
-                )
-        
-        # Confusion Matrix Section
-        gr.Markdown("## Confusion Matrix")
-        with gr.Row():
-            with gr.Column():
-                knn_confusion_plot = gr.Plot(label="KNN Confusion Matrix")
-        
-        # Accuracy vs SNR Plot Section
-        gr.Markdown("## Accuracy vs SNR")
-        with gr.Row():
-            with gr.Column():
-                accuracy_snr_plot = gr.Plot(label="Model Performance Across SNR Levels")
-        
-        # Computation Complexity Table Section
-        gr.Markdown("## Computation Complexity")
-        with gr.Row():
-            with gr.Column():
-                complexity_table = gr.Dataframe(
-                    headers=["Method", "Training Time (seconds)", "Average Inference Time (ms/sample)"],
-                    datatype=["str", "number", "number"],
-                    label="Model Complexity Comparison"
-                )
-        
-        # Wire up auto-refresh
-        timer.tick(
-            fn=update_dashboard,
-            outputs=[
-                server_status,
-                connected_clients,
-                current_round,
-                last_aggregation,
-                aggregation_progress,
-                client_table,
-                historical_trends_plot,
-                before_after_table,
-                metrics_table,
-                knn_confusion_plot,
-                accuracy_snr_plot,
-                complexity_table
-            ]
-        )
-    
-    return dashboard
+# ─── Dashboard Update Functions ───────────────────────────────────────────────
 
-
-def update_dashboard() -> Tuple:
-    """
-    Update all dashboard components with latest data.
-    
-    Returns:
-        Tuple of updated values for all dashboard components
-    """
-    # Update system status
-    server_status_text = get_server_status()
-    connected_clients_text = get_connected_clients_text()
-    current_round_text = get_current_round_text()
-    last_aggregation_text = get_last_aggregation_text()
-    aggregation_progress_text = get_aggregation_progress()
-    
-    # Update client monitoring
-    client_table_data = get_client_monitoring_data()
-    
-    # Update historical trends
-    historical_trends_fig = generate_historical_trends_plot()
-    
-    # Update before/after comparison
-    before_after_table_data = get_before_after_comparison()
-    
-    # Update training metrics
-    metrics_table_data = get_training_metrics_table()
-    
-    # Update confusion matrix (KNN only)
-    knn_confusion_fig = generate_confusion_matrix('knn')
-    
-    # Update accuracy vs SNR plot
-    accuracy_snr_fig = generate_accuracy_vs_snr_plot()
-    
-    # Update complexity table
-    complexity_table_data = get_complexity_table()
-    
-    return (
-        server_status_text,
-        connected_clients_text,
-        current_round_text,
-        last_aggregation_text,
-        aggregation_progress_text,
-        client_table_data,
-        historical_trends_fig,
-        before_after_table_data,
-        metrics_table_data,
-        knn_confusion_fig,
-        accuracy_snr_fig,
-        complexity_table_data
-    )
-
-
-def get_server_status() -> str:
-    """
-    Get server status indicator with emoji.
-    
-    Returns:
-        Status string with emoji indicator
-    """
-    if dashboard_state.server_running:
-        return "🟢 Server is running"
-    else:
-        return "🔴 Server is stopped"
-
-
-def get_connected_clients_text() -> str:
-    """
-    Get connected clients count and IDs.
-    
-    Returns:
-        Formatted string with client count and IDs
-    """
+def get_system_status_html():
+    """Generate system status HTML cards."""
     stats = get_registry_stats()
-    client_count = stats['total_clients']
-    client_ids = stats.get('client_ids', [])
-    
-    if client_count == 0:
-        return "Connected Clients: 0"
-    
-    # Format client IDs for display
-    if len(client_ids) <= 5:
-        ids_display = ", ".join(client_ids)
-        return f"Connected Clients: {client_count} ({ids_display})"
-    else:
-        ids_display = ", ".join(client_ids[:5]) + f", ... (+{len(client_ids) - 5} more)"
-        return f"Connected Clients: {client_count} ({ids_display})"
-
-
-def get_current_round_text() -> str:
-    """
-    Get current training round number.
-    
-    Returns:
-        Formatted string with round number
-    """
-    # Get current round from auto-aggregation state
-    state = get_auto_aggregation_state()
-    current_round = state.get('current_round', 0)
-    return f"Training Round: {current_round}"
-
-
-def get_last_aggregation_text() -> str:
-    """
-    Get last aggregation timestamp (formatted).
-    
-    Returns:
-        Formatted string with last aggregation time
-    """
-    # Check for latest aggregation (KNN only)
+    agg_state = get_auto_aggregation_state()
     knn_result = get_latest_aggregation_result('knn')
-    
-    if knn_result:
-        timestamp = knn_result.get('timestamp')
-        try:
-            dt = datetime.fromisoformat(timestamp)
-            formatted = dt.strftime("%Y-%m-%d %H:%M:%S")
-            return f"Last Aggregation: {formatted}"
-        except:
-            return f"Last Aggregation: {timestamp}"
-    else:
-        return "Last Aggregation: Never"
+
+    n_clients = stats['total_clients']
+    n_samples = stats['total_samples']
+    current_round = agg_state.get('current_round', 0)
+    pending = agg_state.get('pending_uploads', 0)
+    threshold = agg_state.get('threshold', 2)
+
+    # Get accuracy
+    accuracy = "N/A"
+    if knn_result and 'result' in knn_result:
+        acc = knn_result['result'].get('accuracy', 0)
+        accuracy = f"{acc*100:.1f}%" if acc else "N/A"
+
+    # Trust scores summary
+    trust_scores = get_all_trust_scores()
+    avg_trust = np.mean(list(trust_scores.values())) if trust_scores else 0
+    low_trust = sum(1 for s in trust_scores.values() if s < 0.3)
+
+    return f"""
+    <div style="display:grid; grid-template-columns: repeat(6, 1fr); gap:12px; margin-bottom:16px;">
+        <div class="stat-card">
+            <div class="stat-value" style="color:#10b981">&#x25CF;</div>
+            <div class="stat-label">Server Running</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-value" style="color:#6366f1">{n_clients}</div>
+            <div class="stat-label">Connected Clients</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-value" style="color:#8b5cf6">{current_round}</div>
+            <div class="stat-label">Aggregation Round</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-value" style="color:#06b6d4">{pending}/{threshold}</div>
+            <div class="stat-label">Pending Uploads</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-value" style="color:#10b981">{accuracy}</div>
+            <div class="stat-label">Global Accuracy</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-value" style="color:{'#ef4444' if low_trust > 0 else '#10b981'}">{low_trust}</div>
+            <div class="stat-label">Low Trust Clients</div>
+        </div>
+    </div>
+    """
 
 
-def get_client_monitoring_data() -> pd.DataFrame:
-    """
-    Get client monitoring data for display.
-    
-    Displays list of connected clients with columns: Client ID, Status,
-    Last Upload, Sample Count.
-    Shows training progress for active clients (percentage complete).
-    Indicates which clients have submitted updates with checkmark.
-    Updates client list automatically with gr.Timer().
-    
-    Returns:
-        DataFrame with client information for Gradio gr.Dataframe()
-    """
+def get_client_table():
+    """Get client monitoring table."""
     clients = get_client_status()
-    
+    trust_scores = get_all_trust_scores()
+
     if not clients:
-        return pd.DataFrame(columns=["Client ID", "Status", "Last Upload", "Sample Count"])
-    
+        return pd.DataFrame(columns=["Client ID", "Status", "Trust Score",
+                                      "Last Upload", "Samples"])
     data = []
     for client in clients:
+        cid = client['client_id']
         status = client.get('status', 'unknown')
-        
-        # Status display with indicators
+
         if status == 'weights_uploaded':
-            status_display = "✓ Uploaded"
+            status_display = "Uploaded"
         elif status == 'training':
-            # Show training progress if available
-            progress = client.get('training_progress', 0)
-            if progress > 0:
-                status_display = f"⏳ Training ({progress}%)"
-            else:
-                status_display = "⏳ Training"
+            status_display = "Training..."
         elif status == 'idle':
             status_display = "Idle"
         else:
             status_display = "Connected"
-        
-        # Format last upload timestamp
+
+        trust = trust_scores.get(cid, 0.5)
+        trust_display = f"{trust:.2f}"
+
         last_upload = client.get('last_upload', 'Never')
         if last_upload and last_upload != 'Never':
             try:
                 dt = datetime.fromisoformat(last_upload)
-                last_upload = dt.strftime("%Y-%m-%d %H:%M:%S")
-            except:
+                last_upload = dt.strftime("%H:%M:%S")
+            except Exception:
                 pass
-        
-        data.append([
-            client['client_id'],
-            status_display,
-            last_upload,
-            client.get('n_samples', 0)
-        ])
-    
-    return pd.DataFrame(data, columns=["Client ID", "Status", "Last Upload", "Sample Count"])
+
+        data.append([cid, status_display, trust_display,
+                    last_upload, client.get('n_samples', 0)])
+
+    return pd.DataFrame(data, columns=["Client ID", "Status", "Trust Score",
+                                        "Last Upload", "Samples"])
 
 
-def get_training_metrics_table() -> pd.DataFrame:
-    """
-    Generate training metrics comparison table (Table 1 from notebook).
-    
-    Creates a DataFrame with columns: SNR (dB), Baseline Accuracy (%),
-    Decision Tree Accuracy (%), KNN Accuracy (%)
-    
-    Displays accuracy for each SNR level (-20 to 18 dB).
-    Baseline is calculated as 100 / num_classes (random guess).
-    Percentages are formatted to 2 decimal places.
-    
-    Returns:
-        DataFrame with SNR-level accuracy comparison
-    """
-    # Calculate baseline accuracy (random guess)
-    baseline = dashboard_state.get_baseline_accuracy()
-    
-    # Get latest aggregation results (KNN only)
-    knn_result = get_latest_aggregation_result('knn')
-    
-    # Extract per-SNR accuracy if available
-    knn_per_snr = {}
-    
-    if knn_result and 'result' in knn_result:
-        knn_per_snr = knn_result['result'].get('per_snr_accuracy', {})
-    
-    # Build table data
-    data = []
-    for snr in dashboard_state.snr_levels:
-        # Get accuracy for this SNR level, default to 0.0 if not available
-        # Try both int and float keys (JSON may convert float keys to strings)
-        knn_acc = knn_per_snr.get(snr, knn_per_snr.get(float(snr), knn_per_snr.get(str(snr), 0.0)))
-        
-        # Convert to percentage if needed (values might be 0-1 or 0-100)
-        if isinstance(knn_acc, (int, float)) and knn_acc <= 1.0 and knn_acc > 0:
-            knn_acc = knn_acc * 100
-        
-        # Format to 2 decimal places
-        data.append([
-            snr,
-            round(baseline, 2),
-            round(knn_acc, 2)
-        ])
-    
-    return pd.DataFrame(
-        data,
-        columns=["SNR (dB)", "Baseline Accuracy (%)", "KNN Accuracy (%)"]
-    )
+def get_trust_scores_plot():
+    """Generate trust score bar chart."""
+    trust_scores = get_all_trust_scores()
 
+    fig, ax = plt.subplots(figsize=(10, 4))
+    fig.patch.set_facecolor(PLOT_BG)
+    _style_ax(ax)
 
-def generate_confusion_matrix(model_type: str) -> plt.Figure:
-    """
-    Generate confusion matrix visualization (Tables 3 & 4 from notebook).
-    
-    Uses sklearn.metrics.confusion_matrix to compute the matrix.
-    Creates heatmap with sns.heatmap(annot=True, fmt='d', cmap='Blues').
-    Displays confusion matrices at SNR = 0 dB for both models.
-    Uses modulation labels: ['AM', 'FM'] for analog classification.
-    Shows the round number in the title to indicate which aggregation round.
-    
-    Args:
-        model_type: Type of model ('knn' or 'dt')
-    
-    Returns:
-        Matplotlib figure with confusion matrix heatmap for Gradio gr.Plot()
-    """
-    fig, ax = plt.subplots(figsize=(8, 6))
-    
-    # Get latest aggregation result
-    result = get_latest_aggregation_result(model_type)
-    
-    # Extract confusion matrix and round number if available
-    round_num = dashboard_state.current_round
-    if result and 'result' in result:
-        cm_data = result['result'].get('confusion_matrix')
-        # Try to get round number from result metadata
-        if 'round' in result:
-            round_num = result['round']
-        
-        if cm_data is not None:
-            # Convert to numpy array if needed
-            if isinstance(cm_data, list):
-                cm = np.array(cm_data)
-            else:
-                cm = cm_data
-        else:
-            # Placeholder confusion matrix if no data available
-            cm = np.array([[0, 0], [0, 0]])
-    else:
-        # Placeholder confusion matrix
-        cm = np.array([[0, 0], [0, 0]])
-    
-    # Create heatmap
-    sns.heatmap(
-        cm,
-        annot=True,
-        fmt='d',
-        cmap='Blues',
-        xticklabels=dashboard_state.modulation_classes,
-        yticklabels=dashboard_state.modulation_classes,
-        ax=ax,
-        cbar=True
-    )
-    
-    ax.set_xlabel('Predicted Label')
-    ax.set_ylabel('True Label')
-    
-    # Update title to include round number
-    if round_num > 0:
-        ax.set_title(f'{model_type.upper()} Confusion Matrix - Round {round_num} (SNR = 0 dB)')
-    else:
-        ax.set_title(f'{model_type.upper()} Confusion Matrix (SNR = 0 dB)')
-    
-    plt.tight_layout()
-    return fig
-
-
-def generate_accuracy_vs_snr_plot() -> plt.Figure:
-    """
-    Generate accuracy vs SNR line plot (matching notebook figure).
-    
-    Creates line plot with plt.plot(snr_values, accuracy, marker='o').
-    Plots three curves: Baseline (dashed), Decision Tree (solid), KNN (solid).
-    Uses different markers: 'o' for baseline, 'x' for DT, 's' for KNN.
-    Sets y-axis limits: 0 to 105%.
-    Adds grid with plt.grid(True, linestyle='--', alpha=0.7).
-    Adds legend with model names and improvement percentages from baseline.
-    Uses latest global model metrics after aggregation.
-    
-    Returns:
-        Matplotlib figure for Gradio gr.Plot()
-    """
-    fig, ax = plt.subplots(figsize=(10, 6))
-    
-    snr_values = dashboard_state.snr_levels
-    baseline_acc = dashboard_state.get_baseline_accuracy()
-    baseline = [baseline_acc] * len(snr_values)
-    
-    # Get latest aggregation results (KNN only)
-    knn_result = get_latest_aggregation_result('knn')
-    
-    # Extract per-SNR accuracy
-    knn_accuracy = []
-    
-    for snr in snr_values:
-        # Get KNN accuracy for this SNR (try multiple key formats)
-        if knn_result and 'result' in knn_result:
-            knn_per_snr = knn_result['result'].get('per_snr_accuracy', {})
-            knn_acc = knn_per_snr.get(snr, knn_per_snr.get(float(snr), knn_per_snr.get(str(snr), 0.0)))
-            # Convert to percentage if needed
-            if isinstance(knn_acc, (int, float)) and knn_acc <= 1.0 and knn_acc > 0:
-                knn_acc = knn_acc * 100
-            knn_accuracy.append(knn_acc)
-        else:
-            knn_accuracy.append(0.0)
-    
-    # Calculate average improvement from baseline
-    knn_avg_improvement = 0.0
-    
-    if knn_accuracy and any(knn_accuracy):
-        valid_knn = [acc for acc in knn_accuracy if acc > 0]
-        if valid_knn:
-            knn_avg = sum(valid_knn) / len(valid_knn)
-            knn_avg_improvement = knn_avg - baseline_acc
-    
-    # Plot two curves with specified markers and improvement in legend
-    ax.plot(snr_values, baseline, 'k--', marker='o', label='Baseline', alpha=0.7, linewidth=1.5)
-    
-    if knn_avg_improvement > 0:
-        ax.plot(snr_values, knn_accuracy, 'r-', marker='s', 
-                label=f'KNN (+{knn_avg_improvement:.1f}% avg)', 
-                linewidth=2, markersize=6)
-    else:
-        ax.plot(snr_values, knn_accuracy, 'r-', marker='s', 
-                label='KNN', linewidth=2, markersize=6)
-    
-    # Configure axes and grid
-    ax.set_xlabel('SNR (dB)')
-    ax.set_ylabel('Accuracy (%)')
-    ax.set_ylim(0, 105)
-    ax.grid(True, linestyle='--', alpha=0.7)
-    ax.legend(loc='best')
-    ax.set_title('Model Accuracy vs SNR')
-    
-    plt.tight_layout()
-    return fig
-
-
-
-
-
-def get_complexity_table() -> pd.DataFrame:
-    """
-    Generate computation complexity table for KNN model.
-    
-    Creates pandas DataFrame with columns: Method, Training Time (seconds),
-    Average Inference Time (ms/sample).
-    Shows row for "K-Nearest Neighbors" only.
-    Formats training time to 3 decimal places (e.g., "2.345").
-    Formats inference time to 3 decimal places (e.g., "1.234").
-    Shows latest timing metrics from aggregation results.
-    
-    Returns:
-        DataFrame for Gradio gr.Dataframe()
-    """
-    # Get latest aggregation results (KNN only)
-    knn_result = get_latest_aggregation_result('knn')
-    
-    # Extract timing metrics with consistent defaults
-    knn_training_time = 0.000
-    knn_inference_time = 0.000
-    
-    if knn_result and 'result' in knn_result:
-        knn_metrics = knn_result['result']
-        knn_training_time = float(knn_metrics.get('training_time', 0.0))
-        knn_inference_time = float(knn_metrics.get('inference_time_ms_per_sample', 0.0))
-    
-    # Check dashboard state for complexity metrics (fallback)
-    if 'knn' in dashboard_state.complexity_metrics:
-        knn_training_time = float(dashboard_state.complexity_metrics['knn'].get('training_time', knn_training_time))
-        knn_inference_time = float(dashboard_state.complexity_metrics['knn'].get('inference_time', knn_inference_time))
-    
-    # Format to 3 decimal places consistently
-    data = [
-        ["K-Nearest Neighbors", f"{knn_training_time:.3f}", f"{knn_inference_time:.3f}"]
-    ]
-    
-    return pd.DataFrame(
-        data,
-        columns=["Method", "Training Time (seconds)", "Average Inference Time (ms/sample)"]
-    )
-
-
-def generate_historical_trends_plot() -> plt.Figure:
-    """
-    Generate historical accuracy trends over training rounds for KNN.
-    
-    Fetches the last 10 rounds from metrics history and plots before/after
-    accuracy for KNN model. Uses line plots with markers to show the 
-    progression of model performance over time.
-    
-    Returns:
-        Matplotlib figure for Gradio gr.Plot()
-    """
-    fig, ax = plt.subplots(figsize=(10, 6))
-    
-    # Fetch accuracy trends from last 10 rounds
-    trends = get_accuracy_trends()
-    
-    # Handle case with no history data
-    if not trends['rounds']:
-        ax.text(0.5, 0.5, 'No training history available',
-                ha='center', va='center', fontsize=14, transform=ax.transAxes)
-        ax.set_xlim(0, 1)
-        ax.set_ylim(0, 1)
+    if not trust_scores:
+        ax.text(0.5, 0.5, 'No client data', ha='center', va='center',
+               color=PLOT_TEXT, fontsize=14, transform=ax.transAxes)
         ax.axis('off')
         plt.tight_layout()
         return fig
-    
-    rounds = trends['rounds']
-    
-    # Plot KNN trends only
-    ax.plot(rounds, trends['knn_before'], 'r--', marker='o', 
-            label='KNN (Before Agg)', alpha=0.6, linewidth=1.5, markersize=6)
-    ax.plot(rounds, trends['knn_after'], 'r-', marker='o', 
-            label='KNN (After Agg)', linewidth=2, markersize=6)
-    
-    # Configure axes and styling
-    ax.set_xlabel('Training Round')
-    ax.set_ylabel('Accuracy')
-    ax.set_title('KNN Accuracy Trends Over Training Rounds')
-    ax.grid(True, linestyle='--', alpha=0.7)
-    ax.legend(loc='best')
-    
-    # Set y-axis limits to show percentage scale
-    ax.set_ylim(0, 1.05)
-    
+
+    clients = list(trust_scores.keys())
+    scores = list(trust_scores.values())
+    colors = ['#10b981' if s >= 0.5 else '#f59e0b' if s >= 0.3 else '#ef4444'
+              for s in scores]
+
+    bars = ax.barh(clients, scores, color=colors, alpha=0.8, height=0.6)
+
+    # Threshold line
+    ax.axvline(x=0.3, color='#ef4444', linestyle='--', alpha=0.6, label='Rejection Threshold')
+    ax.axvline(x=0.5, color='#f59e0b', linestyle='--', alpha=0.4, label='Warning Threshold')
+
+    ax.set_xlim(0, 1.05)
+    ax.set_xlabel('Trust Score', color=PLOT_TEXT)
+    ax.set_title('Client Trust Scores', color=PLOT_TEXT, fontweight='bold', fontsize=14)
+    ax.legend(facecolor=PLOT_FACE, edgecolor=PLOT_GRID, labelcolor=PLOT_TEXT, fontsize=8)
+    ax.tick_params(colors=PLOT_MUTED)
+
+    # Value labels
+    for bar, score in zip(bars, scores):
+        ax.text(bar.get_width() + 0.02, bar.get_y() + bar.get_height()/2,
+               f'{score:.2f}', va='center', color=PLOT_TEXT, fontsize=10)
+
     plt.tight_layout()
     return fig
 
 
-def get_before_after_comparison() -> pd.DataFrame:
-    """
-    Generate before/after comparison table for the latest aggregation round.
-    
-    Fetches the latest round metrics and formats them as a DataFrame showing
-    the accuracy before aggregation, after aggregation, and the improvement
-    percentage for KNN model.
-    
-    Returns:
-        DataFrame for Gradio gr.Dataframe() with columns:
-        Metric, Before, After, Improvement
-    """
-    # Fetch latest round metrics
+def get_byzantine_report():
+    """Get Byzantine defense report."""
+    aggregator = get_byzantine_aggregator()
+    log = aggregator.get_aggregation_log()
+
+    if not log:
+        return "No Byzantine filtering has occurred yet. Waiting for aggregation rounds."
+
+    latest = log[-1]
+    report = f"""### Byzantine Defense Report - {latest.get('timestamp', 'N/A')[:19]}
+
+| Metric | Value |
+|--------|-------|
+| Strategy | `{latest.get('strategy', 'N/A')}` |
+| Total Clients | {latest.get('total_clients', 0)} |
+| Accepted | {latest.get('accepted_count', 0)} |
+| Rejected | {latest.get('rejected_count', 0)} |
+
+"""
+    rejected = latest.get('rejected_clients', [])
+    if rejected:
+        report += "#### Rejected Clients\n\n"
+        report += "| Client | Reason |\n|--------|--------|\n"
+        for r in rejected:
+            report += f"| {r.get('client_id', 'N/A')} | {r.get('reason', 'N/A')} |\n"
+
+    actions = latest.get('defense_actions', [])
+    if actions:
+        report += f"\n#### Defense Actions ({len(actions)} total)\n\n"
+        for a in actions[-5:]:
+            report += f"- **{a.get('step', 'N/A')}**: {a.get('action', 'N/A')}"
+            if 'client' in a:
+                report += f" ({a['client']})"
+            report += "\n"
+
+    return report
+
+
+def get_accuracy_trends_plot():
+    """Generate accuracy trends over rounds."""
+    trends = get_accuracy_trends()
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    fig.patch.set_facecolor(PLOT_BG)
+    _style_ax(ax)
+
+    if not trends['rounds']:
+        ax.text(0.5, 0.5, 'No training history available',
+               ha='center', va='center', fontsize=14, color=PLOT_TEXT,
+               transform=ax.transAxes)
+        ax.axis('off')
+        plt.tight_layout()
+        return fig
+
+    rounds = trends['rounds']
+
+    ax.plot(rounds, trends['knn_before'], 'o--', color='#6366f1',
+           label='KNN (Before Agg)', alpha=0.6, linewidth=1.5, markersize=6)
+    ax.plot(rounds, trends['knn_after'], 'o-', color='#6366f1',
+           label='KNN (After Agg)', linewidth=2.5, markersize=7)
+
+    # Fill between
+    ax.fill_between(rounds, trends['knn_before'], trends['knn_after'],
+                    alpha=0.1, color='#6366f1')
+
+    ax.set_xlabel('Training Round', color=PLOT_TEXT)
+    ax.set_ylabel('Accuracy', color=PLOT_TEXT)
+    ax.set_title('Accuracy Trends Over Training Rounds', color=PLOT_TEXT,
+                fontweight='bold', fontsize=14)
+    ax.set_ylim(0, 1.05)
+    ax.legend(facecolor=PLOT_FACE, edgecolor=PLOT_GRID, labelcolor=PLOT_TEXT)
+
+    plt.tight_layout()
+    return fig
+
+
+def get_before_after_table():
+    """Generate before/after comparison."""
     latest = get_latest_round_metrics()
-    
-    # Handle case with no aggregation yet
+
     if not latest:
         return pd.DataFrame(
-            [['No aggregation data available', '-', '-', '-']],
+            [['No aggregation data', '-', '-', '-']],
             columns=['Metric', 'Before', 'After', 'Improvement']
         )
-    
-    # Extract KNN metrics only
+
     knn_before = latest['before']['knn_accuracy']
     knn_after = latest['after']['knn_accuracy']
     knn_improvement = latest['improvement']['knn']
-    
-    # Format data with percentage improvement
+
     data = [
-        ['KNN Accuracy', 
-         f"{knn_before:.2%}",
-         f"{knn_after:.2%}",
+        ['KNN Accuracy',
+         f"{knn_before:.2%}", f"{knn_after:.2%}",
          f"+{knn_improvement:.2%}" if knn_improvement >= 0 else f"{knn_improvement:.2%}"]
     ]
-    
+
     return pd.DataFrame(data, columns=['Metric', 'Before', 'After', 'Improvement'])
 
 
-def get_aggregation_progress() -> str:
-    """
-    Get current aggregation progress indicator.
-    
-    Displays the number of clients that have uploaded weights in the current
-    round versus the threshold required to trigger auto-aggregation. Shows
-    a checkmark when the threshold is reached. Also displays auto-aggregation
-    configuration status.
-    
-    Returns:
-        Formatted string with aggregation progress status and configuration
-    """
-    state = get_auto_aggregation_state()
-    pending = state['pending_uploads']
-    threshold = state['threshold']
-    enabled = state['enabled']
-    
-    # Build status message
-    if enabled:
-        status_line = f"**Auto-aggregation:** Enabled (threshold: {threshold})\n\n"
+def get_snr_accuracy_table():
+    """Generate per-SNR accuracy table."""
+    baseline = dashboard_state.get_baseline_accuracy()
+    knn_result = get_latest_aggregation_result('knn')
+
+    knn_per_snr = {}
+    if knn_result and 'result' in knn_result:
+        knn_per_snr = knn_result['result'].get('per_snr_accuracy', {})
+
+    data = []
+    for snr in dashboard_state.snr_levels:
+        knn_acc = knn_per_snr.get(snr, knn_per_snr.get(float(snr),
+                  knn_per_snr.get(str(snr), 0.0)))
+        if isinstance(knn_acc, (int, float)) and 0 < knn_acc <= 1.0:
+            knn_acc = knn_acc * 100
+        data.append([snr, round(baseline, 2), round(knn_acc, 2)])
+
+    return pd.DataFrame(data, columns=["SNR (dB)", "Baseline (%)", "KNN (%)"])
+
+
+def get_accuracy_vs_snr_plot():
+    """Generate accuracy vs SNR plot."""
+    fig, ax = plt.subplots(figsize=(10, 5))
+    fig.patch.set_facecolor(PLOT_BG)
+    _style_ax(ax)
+
+    snr_values = dashboard_state.snr_levels
+    baseline_acc = dashboard_state.get_baseline_accuracy()
+    baseline = [baseline_acc] * len(snr_values)
+
+    knn_result = get_latest_aggregation_result('knn')
+    knn_accuracy = []
+
+    for snr in snr_values:
+        if knn_result and 'result' in knn_result:
+            per_snr = knn_result['result'].get('per_snr_accuracy', {})
+            acc = per_snr.get(snr, per_snr.get(float(snr), per_snr.get(str(snr), 0.0)))
+            if isinstance(acc, (int, float)) and 0 < acc <= 1.0:
+                acc = acc * 100
+            knn_accuracy.append(acc)
+        else:
+            knn_accuracy.append(0.0)
+
+    ax.plot(snr_values, baseline, 'o--', color='#94a3b8', label='Baseline (Random)',
+           alpha=0.7, linewidth=1.5, markersize=5)
+    ax.plot(snr_values, knn_accuracy, 's-', color='#6366f1', label='KNN',
+           linewidth=2.5, markersize=6)
+
+    ax.fill_between(snr_values, baseline, knn_accuracy, alpha=0.1, color='#6366f1')
+
+    ax.set_xlabel('SNR (dB)', color=PLOT_TEXT)
+    ax.set_ylabel('Accuracy (%)', color=PLOT_TEXT)
+    ax.set_ylim(0, 105)
+    ax.set_title('Model Accuracy vs Signal-to-Noise Ratio', color=PLOT_TEXT,
+                fontweight='bold', fontsize=14)
+    ax.legend(facecolor=PLOT_FACE, edgecolor=PLOT_GRID, labelcolor=PLOT_TEXT)
+
+    plt.tight_layout()
+    return fig
+
+
+def get_confusion_matrix_plot():
+    """Generate confusion matrix."""
+    fig, ax = plt.subplots(figsize=(7, 6))
+    fig.patch.set_facecolor(PLOT_BG)
+    ax.set_facecolor(PLOT_FACE)
+
+    result = get_latest_aggregation_result('knn')
+    if result and 'result' in result:
+        cm_data = result['result'].get('confusion_matrix')
+        if cm_data is not None:
+            cm = np.array(cm_data) if isinstance(cm_data, list) else cm_data
+        else:
+            cm = np.array([[0, 0], [0, 0]])
     else:
-        status_line = f"**Auto-aggregation:** Disabled\n\n"
-    
-    # Add progress indicator
-    if pending >= threshold:
-        progress_line = f"✓ Ready for aggregation ({pending}/{threshold} clients)"
-    else:
-        progress_line = f"⏳ Waiting for uploads ({pending}/{threshold} clients)"
-    
-    return status_line + progress_line
+        cm = np.array([[0, 0], [0, 0]])
+
+    classes = dashboard_state.modulation_classes
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+               xticklabels=classes, yticklabels=classes, ax=ax,
+               cbar=True, linewidths=0.5, linecolor=PLOT_GRID)
+
+    ax.set_xlabel('Predicted', color=PLOT_TEXT, fontsize=12)
+    ax.set_ylabel('Actual', color=PLOT_TEXT, fontsize=12)
+
+    agg_state = get_auto_aggregation_state()
+    round_num = agg_state.get('current_round', 0)
+    title = f'KNN Confusion Matrix - Round {round_num}' if round_num > 0 else 'KNN Confusion Matrix'
+    ax.set_title(title, color=PLOT_TEXT, fontweight='bold', fontsize=14)
+    ax.tick_params(colors=PLOT_TEXT)
+
+    plt.tight_layout()
+    return fig
+
+
+def get_complexity_table():
+    """Generate complexity comparison table."""
+    knn_result = get_latest_aggregation_result('knn')
+
+    knn_time = 0.0
+    knn_inference = 0.0
+
+    if knn_result and 'result' in knn_result:
+        knn_time = float(knn_result['result'].get('training_time', 0.0))
+        knn_inference = float(knn_result['result'].get('inference_time_ms_per_sample', 0.0))
+
+    data = [
+        ["K-Nearest Neighbors", f"{knn_time:.3f}", f"{knn_inference:.3f}"],
+    ]
+
+    return pd.DataFrame(data, columns=["Method", "Training Time (s)",
+                                        "Inference Time (ms/sample)"])
+
+
+# ─── Master Update Function ──────────────────────────────────────────────────
+
+def update_dashboard():
+    """Update all dashboard components."""
+    return (
+        get_system_status_html(),
+        get_client_table(),
+        get_trust_scores_plot(),
+        get_byzantine_report(),
+        get_accuracy_trends_plot(),
+        get_before_after_table(),
+        get_snr_accuracy_table(),
+        get_confusion_matrix_plot(),
+        get_accuracy_vs_snr_plot(),
+        get_complexity_table()
+    )
+
+
+# ─── Build Dashboard ─────────────────────────────────────────────────────────
+
+def create_dashboard_interface() -> gr.Blocks:
+    plt.style.use('default')
+
+    with gr.Blocks(
+        title="RadioFed Dashboard",
+        theme=gr.themes.Base(
+            primary_hue=gr.themes.colors.indigo,
+            secondary_hue=gr.themes.colors.purple,
+            neutral_hue=gr.themes.colors.slate,
+            font=gr.themes.GoogleFont("Inter"),
+        ),
+        css=DASHBOARD_CSS
+    ) as dashboard:
+
+        # ── Header ──
+        gr.HTML("""
+        <div class="dashboard-header">
+            <h1>RadioFed Dashboard</h1>
+            <p>Byzantine-Resilient Federated Learning &mdash; Real-Time Monitoring</p>
+        </div>
+        """)
+
+        # Auto-refresh
+        timer = gr.Timer(value=2, active=True)
+
+        # ── Status Cards ──
+        status_html = gr.HTML(value=get_system_status_html())
+
+        with gr.Tabs():
+
+            # ═══ Tab 1: Overview ═══
+            with gr.TabItem("Overview"):
+                with gr.Row():
+                    with gr.Column(scale=2):
+                        gr.Markdown("### Accuracy Trends")
+                        accuracy_trends_plot = gr.Plot(label="Accuracy Over Rounds")
+                    with gr.Column(scale=1):
+                        gr.Markdown("### Before/After Aggregation")
+                        before_after_table = gr.Dataframe(
+                            headers=["Metric", "Before", "After", "Improvement"],
+                            label="Latest Round"
+                        )
+
+                with gr.Row():
+                    with gr.Column():
+                        gr.Markdown("### Confusion Matrix")
+                        confusion_plot = gr.Plot(label="KNN Confusion Matrix")
+                    with gr.Column():
+                        gr.Markdown("### Accuracy vs SNR")
+                        snr_plot = gr.Plot(label="Performance Across SNR Levels")
+
+            # ═══ Tab 2: Clients ═══
+            with gr.TabItem("Client Monitoring"):
+                gr.Markdown("### Connected Clients")
+                client_table = gr.Dataframe(
+                    headers=["Client ID", "Status", "Trust Score", "Last Upload", "Samples"],
+                    label="Client Registry"
+                )
+                gr.Markdown("### Trust Scores")
+                trust_plot = gr.Plot(label="Client Trust Scores")
+
+            # ═══ Tab 3: Byzantine Defense ═══
+            with gr.TabItem("Byzantine Defense"):
+                gr.Markdown("### Byzantine Fault Tolerance")
+                gr.Markdown("""
+                The system employs multiple defense mechanisms against Byzantine (malicious/faulty) clients:
+                - **Krum Selection**: Selects updates closest to the geometric median
+                - **Trimmed Mean**: Removes statistical outliers before aggregation
+                - **Trust Scoring**: Maintains per-client reputation over rounds
+                - **Anomaly Detection**: Statistical checks on feature distributions
+                - **Cosine Filtering**: Rejects updates with low similarity to median
+                """)
+                byzantine_report = gr.Markdown("")
+                gr.Markdown("### Trust Score Visualization")
+                trust_viz_plot = gr.Plot(label="Trust Scores")
+
+            # ═══ Tab 4: Metrics ═══
+            with gr.TabItem("Detailed Metrics"):
+                gr.Markdown("### Per-SNR Accuracy")
+                snr_table = gr.Dataframe(
+                    headers=["SNR (dB)", "Baseline (%)", "KNN (%)"],
+                    label="Accuracy by SNR Level"
+                )
+                gr.Markdown("### Computation Complexity")
+                complexity_table = gr.Dataframe(
+                    headers=["Method", "Training Time (s)", "Inference Time (ms/sample)"],
+                    label="Model Complexity"
+                )
+
+        # Wire up auto-refresh
+        timer.tick(
+            fn=update_dashboard,
+            outputs=[
+                status_html,
+                client_table,
+                trust_plot,
+                byzantine_report,
+                accuracy_trends_plot,
+                before_after_table,
+                snr_table,
+                confusion_plot,
+                snr_plot,
+                complexity_table
+            ]
+        )
+
+    return dashboard

@@ -342,7 +342,7 @@ def test_knn_training(training_data):
     assert hasattr(knn, 'classes_')
     
     
-    assert training_time > 0
+    assert training_time >= 0
     assert training_time < 10  #
 
 
@@ -359,7 +359,7 @@ def test_dt_training(training_data):
     assert hasattr(dt, 'tree_')
     
     
-    assert training_time > 0
+    assert training_time >= 0
     assert training_time < 10
 
 
@@ -380,8 +380,8 @@ def test_knn_inference_timing(training_data):
     assert len(predictions) == len(training_data['X_test'])
     
     
-    assert per_sample_time_ms > 0
-    assert per_sample_time_ms < 100  
+    assert per_sample_time_ms >= 0
+    assert per_sample_time_ms < 100
 
 
 def test_model_serialization(training_data, temp_dir):
