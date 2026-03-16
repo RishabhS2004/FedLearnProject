@@ -8,11 +8,11 @@ A federated learning system for classifying radio signal modulations using Radio
 
 ```bash
 git clone <repo-url> && cd RadioFed
-uv venv .venv && uv pip install -e .
+uv sync
 
-python data/manager.py          # Data Manager  → localhost:7862
-python central/main.py          # Server + Dashboard → localhost:8000, localhost:7860
-python client/main.py --port 7861   # Client UI → localhost:7861
+uv run python data/manager.py              # Data Manager  → localhost:7862
+uv run python central/main.py              # Server + Dashboard → localhost:8000, localhost:7860
+uv run python client/main.py --port 7861   # Client UI → localhost:7861
 ```
 
 ## Services
