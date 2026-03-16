@@ -29,24 +29,17 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/uv
-          key: ${{ runner.os }}-uv-${{ matrix.python-version }}-${{ hashFiles('pyproject.toml') }}
+          key: ${{ runner.os }}-uv-${{ matrix.python-version }}-${{ hashFiles('uv.lock') }}
 
       - name: Install dependencies
         run: uv sync
 
-      - name: Run unit tests (no dataset required)
+      - name: Run tests
         run: |
-          uv run pytest tests/test_byzantine.py tests/test_feature_extract.py tests/test_dataset_loader.py tests/test_dashboard_metrics.py tests/test_integration_amc.py -v --tb=short
-
-      - name: Download and partition RadioML dataset
-        run: |
-          cd data
-          curl -L -o ./radioml2016-deepsigcom.zip \
-            https://www.kaggle.com/api/v1/datasets/download/nolasthitnotomorrow/radioml2016-deepsigcom || echo "Dataset download skipped"
-          unzip -o ./radioml2016-deepsigcom.zip -d ./ || echo "No dataset to unzip"
-
-      - name: Partition dataset
-        run: uv run data/partition_dataset.py --input RML2016.10a_dict.pkl --num-clients 4 || echo "Skipping partition"
-
-      - name: Run full test suite
-        run: uv run pytest -v --maxfail=3 --tb=short
+          uv run pytest tests/test_byzantine.py \
+                        tests/test_feature_extract.py \
+                        tests/test_dataset_loader.py \
+                        tests/test_dashboard_metrics.py \
+                        tests/test_integration_amc.py \
+                        tests/test_e2e_workflow.py \
+                        -v --tb=short

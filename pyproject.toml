@@ -18,10 +18,12 @@ dependencies = [
     "matplotlib>=3.7.5",
     "seaborn>=0.13.2",
     "pandas>=2.0.3",
-    "manim>=0.18.0",
     "plotly>=5.18.0",
     "python-multipart>=0.0.6",
 ]
+
+[project.optional-dependencies]
+animations = ["manim>=0.18.0"]
 
 [project.scripts]
 central-server = "central.main:main"

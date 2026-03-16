@@ -54,7 +54,7 @@ Thumbs.db
 .ipynb_checkpoints/
 
 # ── Lock files ───────────────────────────────────────────
-uv.lock
+# uv.lock is committed for reproducible CI builds
 
 # ── Runtime artifacts ────────────────────────────────────
 .sesskey
