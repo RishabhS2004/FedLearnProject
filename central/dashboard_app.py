@@ -3,7 +3,7 @@ RadioFed Dashboard — FastHTML + HTMX
 Clean, minimal, production monitoring.
 """
 
-import os, sys, io, base64, logging
+import os, sys, io, base64, logging, threading
 from datetime import datetime
 import numpy as np
 import matplotlib
@@ -21,6 +21,15 @@ from central.state import (
 from central.byzantine import get_all_trust_scores, get_byzantine_aggregator
 
 logger = logging.getLogger(__name__)
+
+# ── Background Simulation State ──────────────────────────────────────────────
+
+_sim_lock = threading.Lock()
+_sim_state = {
+    'running': False,
+    'progress': '',
+    'error': None,
+}
 
 # ── Embedded CSS ─────────────────────────────────────────────────────────────
 
@@ -582,7 +591,18 @@ def create_dashboard_app(port=7860):
         return Title("RadioFed"), Div(
             Div(
                 Div(H1("RadioFed"),P("Byzantine-Resilient Federated Learning — Monitoring Dashboard"),cls="hdr"),
-                _stats_partial(),
+                Div(
+                    _stats_partial(),
+                    Div(
+                        Button("Run Simulation", hx_post="/x/run_sim", hx_target="#sim-ctl",
+                               hx_swap="outerHTML",
+                               style="padding:6px 16px;background:#27272a;"
+                               "border:1px solid #3f3f46;border-radius:6px;color:#e4e4e7;"
+                               "cursor:pointer;font-size:.8rem"),
+                        id="sim-ctl",
+                        style="text-align:right;margin-bottom:16px"
+                    ),
+                ),
                 Div(
                     A("Overview",cls="tb on",hx_get="/p/overview",hx_target="#panel",hx_swap="outerHTML"),
                     A("Clients",cls="tb",hx_get="/p/clients",hx_target="#panel",hx_swap="outerHTML"),
@@ -595,18 +615,9 @@ def create_dashboard_app(port=7860):
                 cls="wrap",
             ),
             Div(hx_get="/x/stats",hx_trigger="every 3s",hx_target="#stats",hx_swap="outerHTML",style="display:none"),
+            Div(hx_get="/x/panel_refresh",hx_trigger="every 3s",hx_target="#panel",hx_swap="outerHTML",style="display:none"),
         )
 
-    @app.get("/p/overview")
-    def p_overview(): return _overview()
-    @app.get("/p/clients")
-    def p_clients(): return _clients()
-    @app.get("/p/byzantine")
-    def p_byzantine(): return _byzantine()
-    @app.get("/p/metrics")
-    def p_metrics(): return _metrics()
-    @app.get("/p/howitworks")
-    def p_howitworks(): return _howitworks()
     @app.get("/x/stats")
     def x_stats(): return _stats_partial()
 
@@ -619,4 +630,124 @@ def create_dashboard_app(port=7860):
             return FileResponse(vpath, media_type="video/mp4")
         return FileResponse(vpath)
 
+    # ── Auto-refresh active panel ──
+    # Tracks which panel the user last viewed so auto-refresh re-renders it
+    _active_panel = {'name': 'overview'}
+
+    @app.get("/x/panel_refresh")
+    def x_panel_refresh():
+        p = _active_panel['name']
+        if p == 'clients': return _clients()
+        if p == 'byzantine': return _byzantine()
+        if p == 'metrics': return _metrics()
+        return _overview()
+
+    # Wrap tab endpoints to track active panel
+    @app.get("/p/overview")
+    def p_overview():
+        _active_panel['name'] = 'overview'
+        return _overview()
+    @app.get("/p/clients")
+    def p_clients():
+        _active_panel['name'] = 'clients'
+        return _clients()
+    @app.get("/p/byzantine")
+    def p_byzantine():
+        _active_panel['name'] = 'byzantine'
+        return _byzantine()
+    @app.get("/p/metrics")
+    def p_metrics():
+        _active_panel['name'] = 'metrics'
+        return _metrics()
+    @app.get("/p/howitworks")
+    def p_howitworks():
+        _active_panel['name'] = 'howitworks'
+        return _howitworks()
+
+    # ── Simulation runner ──
+    @app.post("/x/run_sim")
+    def x_run_sim():
+        """Launch a simulation in a background thread (shares process memory)."""
+        with _sim_lock:
+            if _sim_state['running']:
+                return Div(
+                    Span("Simulation already running…", cls="ty"),
+                    Span(cls="sp", style="margin-left:8px"),
+                    id="sim-ctl"
+                )
+            _sim_state['running'] = True
+            _sim_state['progress'] = 'Starting…'
+            _sim_state['error'] = None
+
+        def _run():
+            try:
+                from tests.simulate import simulate
+                simulate(
+                    num_clients=10, num_byzantine=3, n_rounds=15,
+                    feature_mode="16d", models_to_train=("knn", "rf"),
+                    byzantine_strategy="krum", verbose=True,
+                )
+                with _sim_lock:
+                    _sim_state['progress'] = 'Completed ✓'
+            except Exception as e:
+                with _sim_lock:
+                    _sim_state['error'] = str(e)
+                    _sim_state['progress'] = f'Error: {e}'
+            finally:
+                with _sim_lock:
+                    _sim_state['running'] = False
+
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        return Div(
+            Span("Simulation started ", cls="tg"),
+            Span(cls="sp", style="margin-left:8px"),
+            id="sim-ctl",
+            hx_get="/x/sim_status", hx_trigger="every 2s", hx_swap="outerHTML"
+        )
+
+    @app.get("/x/sim_status")
+    def x_sim_status():
+        with _sim_lock:
+            running = _sim_state['running']
+            progress = _sim_state['progress']
+            error = _sim_state['error']
+        if running:
+            return Div(
+                Span(f"Running: {progress}", cls="ty"),
+                Span(cls="sp", style="margin-left:8px"),
+                id="sim-ctl",
+                hx_get="/x/sim_status", hx_trigger="every 2s", hx_swap="outerHTML"
+            )
+        elif error:
+            return Div(
+                Span(f"Error: {error}", cls="tr"),
+                Button("Run Simulation", hx_post="/x/run_sim", hx_target="#sim-ctl",
+                       hx_swap="outerHTML",
+                       style="margin-left:12px;padding:6px 16px;background:#27272a;"
+                       "border:1px solid #3f3f46;border-radius:6px;color:#e4e4e7;"
+                       "cursor:pointer;font-size:.8rem"),
+                id="sim-ctl"
+            )
+        else:
+            return Div(
+                Span(f"{progress} ", cls="tg") if 'Completed' in progress else Span(""),
+                Button("Run Simulation", hx_post="/x/run_sim", hx_target="#sim-ctl",
+                       hx_swap="outerHTML",
+                       style="padding:6px 16px;background:#27272a;"
+                       "border:1px solid #3f3f46;border-radius:6px;color:#e4e4e7;"
+                       "cursor:pointer;font-size:.8rem"),
+                id="sim-ctl"
+            )
+
     return app
+if __name__ == "__main__":
+    import uvicorn
+
+    app = create_dashboard_app()
+
+    uvicorn.run(
+        app,
+        host="127.0.0.1",
+        port=7860,
+    )

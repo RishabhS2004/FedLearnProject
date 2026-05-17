@@ -474,3 +474,108 @@ def create_accuracy_comparison_plot(
         baseline_acc,
         "KNN Model Accuracy vs SNR"
     )
+
+try:
+    import seaborn as sns
+    HAS_SEABORN = True
+except ImportError:
+    HAS_SEABORN = False
+import os
+
+def _setup_plot_style():
+    if HAS_SEABORN:
+        sns.set_style("whitegrid")
+    else:
+        if 'seaborn-whitegrid' in plt.style.available:
+            plt.style.use('seaborn-whitegrid')
+        else:
+            plt.grid(True, linestyle='--', alpha=0.7)
+
+def generate_accuracy_vs_rounds_plot(history_data: dict, output_path: str):
+    """Generate accuracy vs rounds plot."""
+    rounds = []
+    knn_after = []
+    
+    for round_data in history_data.get('rounds', []):
+        rounds.append(round_data.get('round', 0))
+        after_acc = round_data.get('after', {}).get('knn_accuracy', 0.0)
+        knn_after.append(after_acc)
+        
+    if not rounds:
+        return
+
+    _setup_plot_style()
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(rounds, knn_after, marker='o', linewidth=2, markersize=8, color='#1f77b4')
+    
+    ax.set_xlabel('Round')
+    ax.set_ylabel('Accuracy')
+    ax.set_title('Global Model Accuracy vs Rounds')
+    ax.set_ylim([0, 1.05])
+    ax.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
+    
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300)
+    plt.close(fig)
+
+def generate_client_contribution_plot(latest_metrics: dict, output_path: str):
+    """Generate client contribution plot (number of samples per client)."""
+    if not latest_metrics:
+        return
+        
+    client_ids = []
+    samples = []
+    
+    for cid, metrics in latest_metrics.items():
+        client_ids.append(cid)
+        samples.append(metrics.get('n_samples', 0))
+        
+    _setup_plot_style()
+    fig, ax = plt.subplots(figsize=(10, 6))
+    
+    if HAS_SEABORN:
+        sns.barplot(x=client_ids, y=samples, ax=ax, palette="Blues_d")
+    else:
+        ax.bar(client_ids, samples, color='#1f77b4')
+        
+    ax.set_xlabel('Client ID')
+    ax.set_ylabel('Number of Samples')
+    ax.set_title('Client Contribution (Training Samples)')
+    plt.xticks(rotation=45, ha='right')
+    
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300)
+    plt.close(fig)
+
+def generate_per_client_accuracy_plot(latest_metrics: dict, output_path: str):
+    """Generate per-client accuracy plot."""
+    if not latest_metrics:
+        return
+        
+    client_ids = []
+    accuracies = []
+    
+    for cid, metrics in latest_metrics.items():
+        client_ids.append(cid)
+        accuracies.append(metrics.get('test_accuracy', 0.0))
+        
+    _setup_plot_style()
+    fig, ax = plt.subplots(figsize=(10, 6))
+    
+    if HAS_SEABORN:
+        sns.barplot(x=client_ids, y=accuracies, ax=ax, palette="Greens_d")
+    else:
+        ax.bar(client_ids, accuracies, color='#2ca02c')
+        
+    ax.set_xlabel('Client ID')
+    ax.set_ylabel('Test Accuracy')
+    ax.set_title('Per-Client Model Accuracy')
+    ax.set_ylim([0, 1.05])
+    plt.xticks(rotation=45, ha='right')
+    
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300)
+    plt.close(fig)

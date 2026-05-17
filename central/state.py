@@ -1148,8 +1148,13 @@ def evaluate_global_model() -> Dict:
     from sklearn.metrics import accuracy_score, confusion_matrix as compute_confusion_matrix
     
     # Paths to global models
-    knn_model_path = "./central/model_store/global_knn_model.pkl"
-    dt_model_path = "./central/model_store/global_dt_ensemble.pkl"
+    knn_model_path = "out/checkpoints/central/global_knn_model.pkl"
+    if not os.path.exists(knn_model_path):
+        knn_model_path = "./central/model_store/global_knn_model.pkl"
+        
+    dt_model_path = "out/checkpoints/central/global_dt_ensemble.pkl"
+    if not os.path.exists(dt_model_path):
+        dt_model_path = "./central/model_store/global_dt_ensemble.pkl"
     
     knn_accuracy = 0.0
     per_snr_accuracy = {}
