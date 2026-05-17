@@ -337,7 +337,7 @@ def trimmed_mean_filter(
     client_labels_list: List[np.ndarray],
     client_ids: List[str],
     trim_ratio: float = 0.1
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, List[int]]:
     """
     Trimmed mean aggregation: remove extreme feature values before merging.
 
@@ -351,13 +351,14 @@ def trimmed_mean_filter(
         trim_ratio: Fraction of extreme values to trim (each side)
 
     Returns:
-        Tuple of (merged_features, merged_labels) after filtering
+        Tuple of (merged_features, merged_labels, kept_indices) after filtering
     """
     n = len(client_features_list)
     if n < 3:
         # Not enough clients to trim, merge all
         return (np.vstack(client_features_list),
-                np.concatenate(client_labels_list))
+                np.concatenate(client_labels_list),
+                list(range(n)))
 
     # Compute per-client feature means
     client_means = np.array([np.mean(f, axis=0) for f in client_features_list])
@@ -407,7 +408,7 @@ def trimmed_mean_filter(
     kept_features = [client_features_list[i] for i in kept_indices]
     kept_labels = [client_labels_list[i] for i in kept_indices]
 
-    return np.vstack(kept_features), np.concatenate(kept_labels)
+    return np.vstack(kept_features), np.concatenate(kept_labels), kept_indices
 
 
 def cosine_similarity_filter(
@@ -527,10 +528,22 @@ class ByzantineResilientAggregator:
                 - defense_report: Detailed report of defense actions
         """
         n_original = len(client_ids)
+        timestamp = datetime.now().isoformat()
+        
+        if n_original == 0:
+            logger.warning("No clients provided to Byzantine filter. Returning empty aggregation.")
+            report = self._build_report(0, [], [], [{'step': 'empty_input', 'action': 'skipped'}], timestamp)
+            return {
+                'features': np.array([]),
+                'labels': np.array([]),
+                'accepted_clients': [],
+                'rejected_clients': [],
+                'defense_report': report
+            }
+            
         accepted = list(range(n_original))
         rejected = []
         defense_actions = []
-        timestamp = datetime.now().isoformat()
 
         logger.info(f"Byzantine filtering {n_original} clients using strategy='{self.strategy}'")
 
@@ -608,10 +621,23 @@ class ByzantineResilientAggregator:
 
             elif self.strategy == 'trimmed_mean':
                 # Trimmed mean returns merged data directly
-                merged_features, merged_labels = trimmed_mean_filter(
+                merged_features, merged_labels, kept_indices = trimmed_mean_filter(
                     current_features, current_labels, current_ids,
                     trim_ratio=self.max_byzantine_fraction
                 )
+                
+                new_accepted = [current_ids[i] for i in kept_indices]
+                for i, cid in enumerate(current_ids):
+                    if i not in kept_indices:
+                        rejected.append((cid, "Flagged by trimmed mean filter"))
+                        defense_actions.append({
+                            'step': 'trimmed_mean',
+                            'client': cid,
+                            'action': 'rejected'
+                        })
+                
+                accepted = new_accepted
+                
                 defense_actions.append({
                     'step': 'trimmed_mean',
                     'action': 'applied',
@@ -619,13 +645,13 @@ class ByzantineResilientAggregator:
                 })
                 # Return early with merged data
                 report = self._build_report(
-                    n_original, [current_ids[i] for i in range(len(current_ids))],
+                    n_original, accepted,
                     rejected, defense_actions, timestamp
                 )
                 return {
                     'features': merged_features,
                     'labels': merged_labels,
-                    'accepted_clients': current_ids,
+                    'accepted_clients': accepted,
                     'rejected_clients': rejected,
                     'defense_report': report
                 }

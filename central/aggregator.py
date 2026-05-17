@@ -14,14 +14,24 @@ from typing import Dict, List, Tuple, Optional
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, confusion_matrix
+from sklearn.metrics import accuracy_score, confusion_matrix, precision_recall_fscore_support, classification_report
 import time
+from datetime import datetime
+import json
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 from central.byzantine import (
     get_byzantine_aggregator,
     initialize_trust,
     get_trust_score,
     get_all_trust_scores
+)
+from central.metrics import (
+    compute_full_metrics,
+    compute_snr_metrics,
+    evaluate_and_export,
+    MIN_SAMPLES_PER_SNR,
 )
 
 logger = logging.getLogger("federated_central")
@@ -50,7 +60,14 @@ def aggregate_knn_models(
         dict: Aggregation result containing model, metrics, and defense report
     """
     if not client_models_info:
-        raise ValueError("No client models provided for KNN aggregation")
+        logger.warning("No client models provided for KNN aggregation (all clients dropped out).")
+        return {
+            'global_model': None,
+            'num_clients': 0,
+            'total_samples': 0,
+            'byzantine_report': None,
+            'evaluation': None
+        }
 
     logger.info(f"Starting KNN aggregation with {len(client_models_info)} clients")
 
@@ -164,7 +181,8 @@ def aggregate_knn_models(
     global_knn.fit(X_train, y_train)
     training_time = time.time() - train_start
 
-    logger.info(f"Global KNN model trained in {training_time:.3f}s")
+    log_timestamp = datetime.now().strftime('%Y-%m-%dT%H:%M:%S')
+    logger.info(f"[{log_timestamp}] Global KNN model aggregation and training completed in {training_time:.3f}s")
 
     result = {
         'global_model': global_knn,
@@ -195,10 +213,23 @@ def aggregate_knn_models(
             'accuracy': eval_metrics['accuracy'],
             'per_snr_accuracy': eval_metrics['per_snr_accuracy'],
             'confusion_matrix': eval_metrics['confusion_matrix'].tolist(),
-            'n_test_samples': eval_metrics['n_samples']
+            'n_test_samples': eval_metrics['n_samples'],
+            # ── New metrics from central.metrics ──
+            'precision_macro': eval_metrics.get('precision_macro'),
+            'recall_macro': eval_metrics.get('recall_macro'),
+            'f1_macro': eval_metrics.get('f1_macro'),
+            'precision_weighted': eval_metrics.get('precision_weighted'),
+            'recall_weighted': eval_metrics.get('recall_weighted'),
+            'f1_weighted': eval_metrics.get('f1_weighted'),
+            'per_snr_f1_macro': eval_metrics.get('per_snr_f1_macro', {}),
+            'per_snr_f1_weighted': eval_metrics.get('per_snr_f1_weighted', {}),
         })
 
-        logger.info(f"KNN evaluation: accuracy={eval_metrics['accuracy']:.4f}")
+        logger.info(
+            f"KNN evaluation: accuracy={eval_metrics['accuracy']:.4f}, "
+            f"F1_macro={eval_metrics.get('f1_macro', 0):.4f}, "
+            f"F1_weighted={eval_metrics.get('f1_weighted', 0):.4f}"
+        )
 
     return result
 
@@ -220,7 +251,14 @@ def aggregate_dt_models(
         dict: Aggregation result containing model and metrics
     """
     if not client_models_info:
-        raise ValueError("No client models provided for DT aggregation")
+        logger.warning("No client models provided for DT aggregation (all clients dropped out).")
+        return {
+            'global_model': None,
+            'num_clients': 0,
+            'total_samples': 0,
+            'byzantine_report': None,
+            'evaluation': None
+        }
 
     logger.info(f"Starting DT aggregation with {len(client_models_info)} clients")
 
@@ -321,7 +359,8 @@ def aggregate_dt_models(
     global_dt.fit(X_train, y_train)
     training_time = time.time() - train_start
 
-    logger.info(f"Global DT model trained in {training_time:.3f}s")
+    log_timestamp = datetime.now().strftime('%Y-%m-%dT%H:%M:%S')
+    logger.info(f"[{log_timestamp}] Global DT model aggregation and training completed in {training_time:.3f}s")
 
     result = {
         'global_model': global_dt,
@@ -350,10 +389,23 @@ def aggregate_dt_models(
             'accuracy': eval_metrics['accuracy'],
             'per_snr_accuracy': eval_metrics['per_snr_accuracy'],
             'confusion_matrix': eval_metrics['confusion_matrix'].tolist(),
-            'n_test_samples': eval_metrics['n_samples']
+            'n_test_samples': eval_metrics['n_samples'],
+            # ── New metrics from central.metrics ──
+            'precision_macro': eval_metrics.get('precision_macro'),
+            'recall_macro': eval_metrics.get('recall_macro'),
+            'f1_macro': eval_metrics.get('f1_macro'),
+            'precision_weighted': eval_metrics.get('precision_weighted'),
+            'recall_weighted': eval_metrics.get('recall_weighted'),
+            'f1_weighted': eval_metrics.get('f1_weighted'),
+            'per_snr_f1_macro': eval_metrics.get('per_snr_f1_macro', {}),
+            'per_snr_f1_weighted': eval_metrics.get('per_snr_f1_weighted', {}),
         })
 
-        logger.info(f"DT evaluation: accuracy={eval_metrics['accuracy']:.4f}")
+        logger.info(
+            f"DT evaluation: accuracy={eval_metrics['accuracy']:.4f}, "
+            f"F1_macro={eval_metrics.get('f1_macro', 0):.4f}, "
+            f"F1_weighted={eval_metrics.get('f1_weighted', 0):.4f}"
+        )
 
     return result
 
@@ -414,12 +466,24 @@ def evaluate_global_model(
     model: object,
     test_features: np.ndarray,
     test_labels: np.ndarray,
-    test_snrs: np.ndarray = None
+    test_snrs: np.ndarray = None,
+    min_samples_per_snr: int = MIN_SAMPLES_PER_SNR,
 ) -> Dict:
     """
     Evaluate global model on validation/test set.
 
-    Computes overall accuracy, per-SNR accuracy breakdown, and confusion matrix.
+    Computes overall accuracy, per-SNR accuracy + F1 breakdown,
+    confusion matrix, and saves metrics in JSON, CSV, and text formats.
+
+    Returns:
+        dict with backward-compatible keys:
+            accuracy, precision, recall, f1_score, per_class_accuracy,
+            per_snr_accuracy, confusion_matrix, n_samples, predictions
+        plus new keys:
+            precision_macro, recall_macro, f1_macro,
+            precision_weighted, recall_weighted, f1_weighted,
+            per_snr_f1_macro, per_snr_f1_weighted,
+            classification_report_text
     """
     if len(test_features) != len(test_labels):
         raise ValueError("Number of test features must match number of test labels")
@@ -430,37 +494,141 @@ def evaluate_global_model(
     logger.info(f"Evaluating global model on {len(test_features)} test samples")
 
     predictions = model.predict(test_features)
-    accuracy = accuracy_score(test_labels, predictions)
     conf_matrix = confusion_matrix(test_labels, predictions)
 
+    # ── Compute comprehensive metrics via central.metrics ──
+    full_metrics = compute_full_metrics(test_labels, predictions)
+
+    # Per-SNR metrics (accuracy + F1)
     per_snr_accuracy = {}
+    per_snr_f1_macro = {}
+    per_snr_f1_weighted = {}
     if test_snrs is not None:
-        unique_snrs = np.unique(test_snrs)
-        for snr in unique_snrs:
-            snr_mask = test_snrs == snr
-            snr_labels = test_labels[snr_mask]
-            snr_predictions = predictions[snr_mask]
+        snr_metrics = compute_snr_metrics(
+            test_labels, predictions, test_snrs, min_samples=min_samples_per_snr
+        )
+        per_snr_accuracy = snr_metrics['per_snr_accuracy']
+        per_snr_f1_macro = snr_metrics['per_snr_f1_macro']
+        per_snr_f1_weighted = snr_metrics['per_snr_f1_weighted']
 
-            if len(snr_labels) > 0:
-                snr_accuracy = accuracy_score(snr_labels, snr_predictions)
-                per_snr_accuracy[float(snr)] = snr_accuracy
+    # Per-class accuracy (backward-compatible format)
+    row_sums = conf_matrix.sum(axis=1)
+    per_class_accuracy = {}
+    for idx, (diag, r_sum) in enumerate(zip(conf_matrix.diagonal(), row_sums)):
+        class_name = f"Class {idx}"
+        per_class_accuracy[class_name] = float(diag / r_sum) if r_sum > 0 else 0.0
 
+    # ── Persist plots and reports (existing behavior) ──
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    os.makedirs('out/plots', exist_ok=True)
+    os.makedirs('out/reports', exist_ok=True)
+
+    # Confusion matrix plot (normalized, indicating in filename as requested)
+    class_labels = [f"Class {i}" for i in range(len(conf_matrix))]
+    from central.evaluation_plots import plot_confusion_matrix_normalized
+    plot_path = plot_confusion_matrix_normalized(
+        conf_matrix=conf_matrix,
+        class_names=class_labels,
+        title="Normalized Confusion Matrix",
+        output_path=f"out/plots/confusion_matrix_normalized_{timestamp}.png",
+        timestamp=timestamp,
+        accuracy=full_metrics["accuracy"],
+        f1_macro=full_metrics["f1_macro"],
+        f1_weighted=full_metrics["f1_weighted"],
+    )
+
+    # ── NEW: Publication-quality plots via central.evaluation_plots ──
+    try:
+        from central.evaluation_plots import generate_all_evaluation_plots
+        eval_plot_paths = generate_all_evaluation_plots(
+            conf_matrix=conf_matrix,
+            per_snr_accuracy=per_snr_accuracy,
+            per_snr_f1_macro=per_snr_f1_macro,
+            per_snr_f1_weighted=per_snr_f1_weighted,
+            class_names=class_labels,
+            timestamp=timestamp,
+            accuracy=full_metrics["accuracy"],
+            f1_macro=full_metrics["f1_macro"],
+            f1_weighted=full_metrics["f1_weighted"],
+        )
+        logger.info(f"Publication-quality evaluation plots generated: {list(eval_plot_paths.keys())}")
+    except Exception as e:
+        logger.warning(f"Could not generate evaluation plots: {e}")
+
+    # Legacy eval report (existing format, enriched with new fields)
+    report_data = {
+        'timestamp': timestamp,
+        'accuracy': full_metrics['accuracy'],
+        'precision_macro': full_metrics['precision_macro'],
+        'recall_macro': full_metrics['recall_macro'],
+        'f1_score_macro': full_metrics['f1_macro'],
+        'precision_weighted': full_metrics['precision_weighted'],
+        'recall_weighted': full_metrics['recall_weighted'],
+        'f1_score_weighted': full_metrics['f1_weighted'],
+        'per_class_accuracy': per_class_accuracy,
+        'per_snr_accuracy': per_snr_accuracy,
+        'per_snr_f1_macro': per_snr_f1_macro,
+        'per_snr_f1_weighted': per_snr_f1_weighted,
+        'classification_report': full_metrics['classification_report'],
+    }
+    report_path = f'out/reports/eval_report_{timestamp}.json'
+    with open(report_path, 'w') as f:
+        json.dump(report_data, f, indent=4)
+
+    # ── NEW: Export metrics via central.metrics (JSON + CSV + report text) ──
+    export_metrics = dict(full_metrics)
+    export_metrics['per_snr_accuracy'] = per_snr_accuracy
+    export_metrics['per_snr_f1_macro'] = per_snr_f1_macro
+    export_metrics['per_snr_f1_weighted'] = per_snr_f1_weighted
+    export_metrics['per_class_accuracy'] = per_class_accuracy
+    try:
+        from central.metrics import save_metrics_json, save_metrics_csv, save_classification_report_text
+        os.makedirs('out/metrics', exist_ok=True)
+        save_metrics_json(export_metrics, f'out/metrics/metrics_{timestamp}.json')
+        save_metrics_csv(export_metrics, f'out/metrics/metrics_{timestamp}.csv')
+        save_classification_report_text(
+            full_metrics['classification_report_text'],
+            f'out/metrics/classification_report_{timestamp}.txt'
+        )
+    except Exception as e:
+        logger.warning(f"Could not export metrics to out/metrics/: {e}")
+
+    logger.info(f"Evaluation report saved to {report_path}")
+    logger.info(f"Confusion matrix plot saved to {plot_path}")
+
+    # ── Return backward-compatible dict + new keys ──
     return {
-        'accuracy': float(accuracy),
+        # Backward-compatible keys (existing consumers use these)
+        'accuracy': full_metrics['accuracy'],
+        'precision': full_metrics['precision_macro'],
+        'recall': full_metrics['recall_macro'],
+        'f1_score': full_metrics['f1_macro'],
+        'per_class_accuracy': per_class_accuracy,
         'per_snr_accuracy': per_snr_accuracy,
         'confusion_matrix': conf_matrix,
         'n_samples': len(test_features),
-        'predictions': predictions
+        'predictions': predictions,
+        # New enriched keys
+        'precision_macro': full_metrics['precision_macro'],
+        'recall_macro': full_metrics['recall_macro'],
+        'f1_macro': full_metrics['f1_macro'],
+        'precision_weighted': full_metrics['precision_weighted'],
+        'recall_weighted': full_metrics['recall_weighted'],
+        'f1_weighted': full_metrics['f1_weighted'],
+        'per_snr_f1_macro': per_snr_f1_macro,
+        'per_snr_f1_weighted': per_snr_f1_weighted,
+        'classification_report_text': full_metrics['classification_report_text'],
     }
 
 
 # ── FedAvg for MLP Neural Networks ───────────────────────────────────────────
 
 def aggregate_mlp_fedavg(
-    client_model_paths: List[str],
-    n_samples_per_client: List[int],
+    client_model_paths: List[str] = None,
+    n_samples_per_client: List[int] = None,
     test_features: np.ndarray = None,
     test_labels: np.ndarray = None,
+    client_models: List = None,
 ) -> Dict:
     """
     FedAvg: Average MLP neural network weights across clients,
@@ -470,13 +638,22 @@ def aggregate_mlp_fedavg(
     Unlike data-centric aggregation, FedAvg averages model parameters directly.
     """
     models = []
-    for path in client_model_paths:
-        if os.path.exists(path):
-            with open(path, 'rb') as f:
-                models.append(pickle.load(f))
+    if client_models is not None:
+        models = client_models
+    elif client_model_paths is not None:
+        for path in client_model_paths:
+            if os.path.exists(path):
+                with open(path, 'rb') as f:
+                    models.append(pickle.load(f))
 
     if not models:
-        raise ValueError("No MLP models found for FedAvg")
+        logger.warning("No MLP models found for FedAvg (all clients dropped out).")
+        return {
+            'global_model': None,
+            'num_clients': 0,
+            'total_samples': 0,
+            'evaluation': None
+        }
 
     # Verify all models are MLPClassifier
     from sklearn.neural_network import MLPClassifier

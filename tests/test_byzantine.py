@@ -179,7 +179,7 @@ class TestTrimmedMeanFilter:
         for cid in ids:
             initialize_trust(cid)
 
-        merged_f, merged_l = trimmed_mean_filter(features, labels, ids, trim_ratio=0.2)
+        merged_f, merged_l, _ = trimmed_mean_filter(features, labels, ids, trim_ratio=0.2)
         # Should have fewer samples than total
         total = sum(len(f) for f in features)
         assert len(merged_f) < total
@@ -189,7 +189,7 @@ class TestTrimmedMeanFilter:
         labels = [np.array([0]*25 + [1]*25) for _ in range(2)]
         ids = ["c1", "c2"]
 
-        merged_f, merged_l = trimmed_mean_filter(features, labels, ids)
+        merged_f, merged_l, _ = trimmed_mean_filter(features, labels, ids)
         assert len(merged_f) == 100
 
 
