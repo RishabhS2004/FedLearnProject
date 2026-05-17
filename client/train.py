@@ -7,6 +7,9 @@ differential privacy, per-SNR model selection.
 
 import numpy as np
 import os, pickle, time, logging
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from config_loader import get_config_val
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
@@ -24,13 +27,37 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
-def _train(model, name, features, labels, test_split=0.3, random_state=42, verbose=True):
+def _train(model, name, features, labels, test_split=0.3, random_state=42, verbose=True, test_data=None, **kwargs):
     """Shared training logic with comprehensive ML metrics."""
     if verbose:
         logger.info(f"Training {name} — {len(features)} samples")
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        features, labels, test_size=test_split, random_state=random_state, stratify=labels)
+    if test_data is not None:
+        X_train, y_train = features, labels
+        X_test, y_test = test_data
+    else:
+        X_train, X_test, y_train, y_test = train_test_split(
+            features, labels, test_size=test_split, random_state=random_state, stratify=labels)
+ 
+    # Log distribution before SMOTE
+    unique, counts = np.unique(y_train, return_counts=True)
+    dist = dict(zip(unique, counts))
+    if verbose:
+        logger.info(f"Class distribution (train): {dist}")
+ 
+    # Optional SMOTE oversampling
+    smote = kwargs.get('smote', False)
+    if smote:
+        try:
+            from imblearn.over_sampling import SMOTE
+            sm = SMOTE(random_state=random_state)
+            X_train, y_train = sm.fit_resample(X_train, y_train)
+            if verbose:
+                unique_s, counts_s = np.unique(y_train, return_counts=True)
+                dist_s = dict(zip(unique_s, counts_s))
+                logger.info(f"SMOTE: Balanced distribution to {dist_s}")
+        except ImportError:
+            logger.warning("imblearn not found. Skipping SMOTE.")
 
     t0 = time.time()
     model.fit(X_train, y_train)
@@ -165,62 +192,129 @@ def per_snr_best_model(results_dict, features, labels, snrs):
 # ── Model Trainers ────────────────────────────────────────────────────────────
 
 def train_knn_model(features, labels, test_split=0.3, n_neighbors=5,
-                    weights='uniform', random_state=42, verbose=True):
+                    weights='uniform', random_state=42, verbose=True, test_data=None, **kwargs):
     return _train(KNeighborsClassifier(n_neighbors=n_neighbors, weights=weights),
-                  f"KNN (k={n_neighbors}, {weights})", features, labels, test_split, random_state, verbose)
+                  f"KNN (k={n_neighbors}, {weights})", features, labels, test_split, random_state, verbose, test_data, **kwargs)
 
 def train_dt_model(features, labels, test_split=0.3, max_depth=None,
-                   min_samples_split=2, random_state=42, verbose=True):
+                   min_samples_split=2, random_state=42, verbose=True, test_data=None, **kwargs):
     return _train(DecisionTreeClassifier(max_depth=max_depth, min_samples_split=min_samples_split,
-                  random_state=random_state),
+                  random_state=random_state, class_weight='balanced'),
                   f"Decision Tree (depth={'all' if max_depth is None else max_depth})",
-                  features, labels, test_split, random_state, verbose)
+                  features, labels, test_split, random_state, verbose, test_data, **kwargs)
 
 def train_rf_model(features, labels, test_split=0.3, n_estimators=100,
-                   max_depth=None, random_state=42, verbose=True):
+                   max_depth=None, random_state=42, verbose=True, test_data=None, **kwargs):
     return _train(RandomForestClassifier(n_estimators=n_estimators, max_depth=max_depth,
-                  random_state=random_state),
-                  f"Random Forest (n={n_estimators})", features, labels, test_split, random_state, verbose)
+                  random_state=random_state, class_weight='balanced'),
+                  f"Random Forest (n={n_estimators})", features, labels, test_split, random_state, verbose, test_data, **kwargs)
 
 def train_gb_model(features, labels, test_split=0.3, n_estimators=100,
-                   learning_rate=0.1, max_depth=3, random_state=42, verbose=True):
-    return _train(GradientBoostingClassifier(n_estimators=n_estimators, learning_rate=learning_rate,
+                   learning_rate=None, max_depth=3, random_state=42, verbose=True, test_data=None, **kwargs):
+    lr = learning_rate if learning_rate is not None else (get_config_val("training", "learning_rate") or 0.1)
+    return _train(GradientBoostingClassifier(n_estimators=n_estimators, learning_rate=lr,
                   max_depth=max_depth, random_state=random_state),
-                  f"Gradient Boosting (n={n_estimators}, lr={learning_rate})",
-                  features, labels, test_split, random_state, verbose)
+                  f"Gradient Boosting (n={n_estimators}, lr={lr})",
+                  features, labels, test_split, random_state, verbose, test_data, **kwargs)
 
 def train_svm_model(features, labels, test_split=0.3, kernel='rbf',
-                    C=1.0, random_state=42, verbose=True):
-    return _train(SVC(kernel=kernel, C=C, random_state=random_state),
-                  f"SVM ({kernel}, C={C})", features, labels, test_split, random_state, verbose)
+                    C=1.0, random_state=42, verbose=True, test_data=None, **kwargs):
+    return _train(SVC(kernel=kernel, C=C, random_state=random_state, class_weight='balanced'),
+                  f"SVM ({kernel}, C={C})", features, labels, test_split, random_state, verbose, test_data, **kwargs)
 
 def train_lr_model(features, labels, test_split=0.3, C=1.0,
-                   max_iter=1000, random_state=42, verbose=True):
-    return _train(LogisticRegression(C=C, max_iter=max_iter, random_state=random_state),
-                  f"Logistic Regression (C={C})", features, labels, test_split, random_state, verbose)
+                   max_iter=1000, random_state=42, verbose=True, test_data=None, **kwargs):
+    return _train(LogisticRegression(C=C, max_iter=max_iter, random_state=random_state, class_weight='balanced'),
+                  f"Logistic Regression (C={C})", features, labels, test_split, random_state, verbose, test_data, **kwargs)
 
-def train_nb_model(features, labels, test_split=0.3, verbose=True):
-    return _train(GaussianNB(), "Gaussian Naive Bayes", features, labels, test_split, 42, verbose)
+def train_nb_model(features, labels, test_split=0.3, verbose=True, test_data=None, **kwargs):
+    return _train(GaussianNB(), "Gaussian Naive Bayes", features, labels, test_split, 42, verbose, test_data, **kwargs)
 
-def train_mlp_model(features, labels, test_split=0.3, hidden_layers=(64, 32),
-                    max_iter=300, random_state=42, verbose=True):
-    return _train(MLPClassifier(hidden_layer_sizes=hidden_layers, max_iter=max_iter,
-                  random_state=random_state),
-                  f"MLP {hidden_layers}", features, labels, test_split, random_state, verbose)
+def train_mlp_model(features, labels, test_split=0.3, hidden_layers=(128, 64),
+                    max_iter=None, batch_size=None, random_state=42, verbose=True, test_data=None, **kwargs):
+    epochs = max_iter if max_iter is not None else (get_config_val("training", "epochs") or 300)
+    bs = batch_size if batch_size is not None else (get_config_val("training", "batch_size") or 'auto')
+    return _train(MLPClassifier(hidden_layer_sizes=hidden_layers, max_iter=epochs,
+                  batch_size=bs, random_state=random_state),
+                  f"MLP {hidden_layers}", features, labels, test_split, random_state, verbose, test_data, **kwargs)
+
+def train_mlp_incremental(features, labels, global_model=None, test_split=0.3, 
+                          hidden_layers=(128, 64), random_state=42, verbose=True, **kwargs):
+    """
+    Incrementally train a Multi-Layer Perceptron starting from global weights.
+    Used for genuine FedAvg FL dynamics.
+    """
+    import time
+    
+    X_train, X_test, y_train, y_test = train_test_split(
+        features, labels, test_size=test_split, random_state=random_state, stratify=labels)
+        
+    unique_classes = np.unique(np.concatenate([y_train, y_test]))
+
+    # Optional SMOTE oversampling
+    smote = kwargs.get('smote', False)
+    if smote:
+        try:
+            from imblearn.over_sampling import SMOTE
+            sm = SMOTE(random_state=random_state)
+            X_train, y_train = sm.fit_resample(X_train, y_train)
+            if verbose:
+                unique_s, counts_s = np.unique(y_train, return_counts=True)
+                dist_s = dict(zip(unique_s, counts_s))
+                logger.info(f"SMOTE (MLP): Balanced distribution to {dist_s}")
+        except ImportError:
+            if verbose:
+                logger.warning("imblearn not found. Skipping SMOTE.")
+    
+    if global_model is None:
+        # First round: initialize a new model
+        model = MLPClassifier(
+            hidden_layer_sizes=hidden_layers, activation='relu', solver='adam',
+            random_state=random_state)
+        # partial_fit initialized with all 11 classes
+        model.partial_fit(X_train, y_train, classes=np.arange(11))
+    else:
+        # Subsequent rounds: start from global model
+        model = pickle.loads(pickle.dumps(global_model))
+        
+    t0 = time.time()
+    # Do 5 epochs of partial_fit to simulate local epochs
+    for _ in range(5):
+        model.partial_fit(X_train, y_train)
+    training_time = time.time() - t0
+    
+    test_preds = model.predict(X_test)
+    test_acc = accuracy_score(y_test, test_preds)
+    avg = 'weighted'
+    f1 = f1_score(y_test, test_preds, average=avg, zero_division=0)
+    kappa = cohen_kappa_score(y_test, test_preds)
+    
+    if verbose:
+        logger.info(f"MLP (Incremental): acc={test_acc*100:.2f}% F1={f1:.4f}")
+        
+    return {
+        'model': model,
+        'model_name': 'MLP Neural Network',
+        'test_accuracy': test_acc,
+        'f1_score': f1,
+        'cohen_kappa': kappa,
+        'training_time': training_time,
+        'n_samples': len(X_train)
+    }
 
 
 # ── Model factory (for CV) ───────────────────────────────────────────────────
 
 MODEL_FACTORIES = {
     'knn': lambda **kw: KNeighborsClassifier(n_neighbors=kw.get('k', 5), weights=kw.get('weights', 'uniform')),
-    'dt':  lambda **kw: DecisionTreeClassifier(max_depth=kw.get('max_depth'), random_state=42),
-    'rf':  lambda **kw: RandomForestClassifier(n_estimators=kw.get('n_estimators', 100), random_state=42),
+    'dt':  lambda **kw: DecisionTreeClassifier(max_depth=kw.get('max_depth'), random_state=42, class_weight='balanced'),
+    'rf':  lambda **kw: RandomForestClassifier(n_estimators=kw.get('n_estimators', 100), random_state=42, class_weight='balanced'),
     'gb':  lambda **kw: GradientBoostingClassifier(n_estimators=kw.get('n_estimators', 100),
                          learning_rate=kw.get('learning_rate', 0.1), random_state=42),
-    'svm': lambda **kw: SVC(kernel=kw.get('kernel', 'rbf'), C=kw.get('C', 1.0), random_state=42),
-    'lr':  lambda **kw: LogisticRegression(C=kw.get('C', 1.0), max_iter=1000, random_state=42),
+    'svm': lambda **kw: SVC(kernel=kw.get('kernel', 'rbf'), C=kw.get('C', 1.0), random_state=42, class_weight='balanced'),
+    'lr':  lambda **kw: LogisticRegression(C=kw.get('C', 1.0), max_iter=1000, random_state=42, class_weight='balanced'),
     'nb':  lambda **kw: GaussianNB(),
-    'mlp': lambda **kw: MLPClassifier(hidden_layer_sizes=kw.get('hidden_layers', (64, 32)),
+    'mlp': lambda **kw: MLPClassifier(hidden_layer_sizes=kw.get('hidden_layers', (128, 64)),
                          max_iter=300, random_state=42),
 }
 

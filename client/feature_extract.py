@@ -5,14 +5,20 @@ This module converts I/Q samples from the RadioML dataset into
 feature vectors for machine learning. Supports multiple feature
 dimensionalities:
 
-  - 8D  : Analog AMC features (instantaneous amplitude/frequency statistics)
-  - 16D : Traditional features (I/Q stats + spectral + time-domain)
-  - 24D : Extended features (16D + higher-order cumulants + envelope + phase)
-
-The 24D mode adds discriminative features drawn from the AMC literature:
-  Higher-Order Cumulants  (C20, C21, C40, C42)
-  Signal envelope features (max/min ratio, crest factor)
-  Phase features           (phase std, phase entropy)
+   - 8D  : Analog AMC features (instantaneous amplitude/frequency statistics)
+   - 16D : Traditional features (I/Q stats + spectral + time-domain)
+   - 24D : Extended features (16D + higher-order cumulants + envelope + phase)
+   - 32D : Premium features (24D + spectral entropy + PAPR + 5th/6th order moments)
+ 
+ The 24D mode adds discriminative features drawn from the AMC literature:
+   Higher-Order Cumulants  (C20, C21, C40, C42)
+   Signal envelope features (max/min ratio, crest factor)
+   Phase features           (phase std, phase entropy)
+ 
+ The 32D mode adds:
+   Spectral Entropy         (Measure of frequency distribution complexity)
+   PAPR                     (Peak-to-Average Power Ratio)
+   Higher-Order Moments     (5th and 6th order moments of amplitude and frequency)
 """
 
 import numpy as np
@@ -268,6 +274,50 @@ def compute_phase_features(signal: np.ndarray, n_bins: int = 64, epsilon: float 
         'phase_std': float(np.nan_to_num(phase_std, nan=0.0)),
         'phase_entropy': float(np.nan_to_num(phase_entropy, nan=0.0, posinf=0.0, neginf=0.0)),
     }
+ 
+ 
+# ---------------------------------------------------------------------------
+# Premium features (for 32D)
+# ---------------------------------------------------------------------------
+ 
+def compute_spectral_entropy(signal: np.ndarray, epsilon: float = 1e-12) -> float:
+    """
+    Compute Shannon entropy of the Power Spectral Density (PSD).
+    High entropy = noise-like/complex spectrum, Low entropy = pure tones.
+    """
+    psd = np.abs(np.fft.fft(signal))**2
+    psd = psd / (np.sum(psd) + epsilon)
+    psd = psd[psd > epsilon]
+    entropy = -np.sum(psd * np.log2(psd + epsilon))
+    return float(np.nan_to_num(entropy, nan=0.0, posinf=0.0, neginf=0.0))
+ 
+ 
+def compute_papr(signal: np.ndarray, epsilon: float = 1e-12) -> float:
+    """
+    Compute Peak-to-Average Power Ratio (PAPR) in dB.
+    PAPR = 10 * log10(max(power) / mean(power))
+    """
+    power = np.abs(signal)**2
+    peak_power = np.max(power)
+    avg_power = np.mean(power)
+    papr = 10 * np.log10(peak_power / (avg_power + epsilon) + epsilon)
+    return float(np.nan_to_num(papr, nan=0.0, posinf=100.0, neginf=0.0))
+ 
+ 
+def compute_higher_order_moments(data: np.ndarray, orders: list = [5, 6], epsilon: float = 1e-12) -> Dict[str, float]:
+    """
+    Compute standardized higher-order moments (5th, 6th, etc.).
+    These capture the fine-grained shape of the distribution tail.
+    """
+    mean = np.mean(data)
+    std = np.std(data) + epsilon
+    centered = data - mean
+    
+    res = {}
+    for p in orders:
+        moment = np.mean(centered**p) / (std**p + epsilon)
+        res[f'M{p}'] = float(np.nan_to_num(moment, nan=0.0, posinf=1e6, neginf=-1e6))
+    return res
 
 
 # ---------------------------------------------------------------------------
@@ -458,6 +508,45 @@ def _extract_extended_features(signal: np.ndarray) -> np.ndarray:
     # Sanitise
     extra = np.nan_to_num(extra, nan=0.0, posinf=1e6, neginf=0.0)
     return extra
+ 
+ 
+def _extract_premium_features(signal: np.ndarray) -> np.ndarray:
+    """
+    Internal helper: extract the 8 *additional* features that turn
+    a 24D vector into a 32D vector.
+    
+    Features:
+        [24] Spectral entropy
+        [25] PAPR (dB)
+        [26] 5th moment (Amplitude)
+        [27] 6th moment (Amplitude)
+        [28] 5th moment (Frequency)
+        [29] 6th moment (Frequency)
+        [30] 5th moment (Phase)
+        [31] 6th moment (Phase)
+    """
+    amplitude = np.abs(signal)
+    frequency = compute_instantaneous_frequency(signal)
+    phase = np.angle(signal)
+    
+    spec_ent = compute_spectral_entropy(signal)
+    papr = compute_papr(signal)
+    amp_moments = compute_higher_order_moments(amplitude)
+    freq_moments = compute_higher_order_moments(frequency)
+    phase_moments = compute_higher_order_moments(phase)
+    
+    premium = np.array([
+        spec_ent,
+        papr,
+        amp_moments['M5'],
+        amp_moments['M6'],
+        freq_moments['M5'],
+        freq_moments['M6'],
+        phase_moments['M5'],
+        phase_moments['M6'],
+    ], dtype=np.float32)
+    
+    return np.nan_to_num(premium, nan=0.0, posinf=1e6, neginf=-1e6)
 
 
 # ---------------------------------------------------------------------------
@@ -504,38 +593,12 @@ def extract_features_from_iq(
 
 
 # ---------------------------------------------------------------------------
-# Public API — new 24D entry point
+# Public API — new 24D and 32D entry points
 # ---------------------------------------------------------------------------
 
 def extract_features_from_iq_extended(iq_sample: np.ndarray) -> np.ndarray:
     """
     Extract 24-dimensional feature vector from I/Q samples.
-
-    This is the *full* feature set, combining the original 16D
-    traditional features with 8 additional discriminative features
-    used in the AMC literature.
-
-    Feature layout (24D):
-        [ 0- 4] I-channel statistics   (mean, std, var, skew, kurt)
-        [ 5- 9] Q-channel statistics   (mean, std, var, skew, kurt)
-        [10-13] Spectral features       (FFT peak mag, FFT peak freq,
-                                         spectral centroid, spectral BW)
-        [14-15] Time-domain features    (zero-crossing rate, energy)
-        ------- new features below -------
-        [16]    C20  — 2nd-order cumulant |E[x^2]|
-        [17]    C21  — 2nd-order cumulant E[|x|^2] (signal power)
-        [18]    C40  — 4th-order cumulant
-        [19]    C42  — 4th-order cumulant (mixed conjugate)
-        [20]    Envelope max/min ratio
-        [21]    Crest factor (peak / RMS)
-        [22]    Phase standard deviation
-        [23]    Phase entropy (Shannon, histogram-based)
-
-    Args:
-        iq_sample: I/Q sample with shape (2, 128)
-
-    Returns:
-        24-element float32 numpy array
     """
     if iq_sample.shape != (2, 128):
         raise ValueError(f"Expected shape (2, 128), got {iq_sample.shape}")
@@ -548,7 +611,23 @@ def extract_features_from_iq_extended(iq_sample: np.ndarray) -> np.ndarray:
     extra = _extract_extended_features(signal)
 
     combined = np.concatenate([base, extra])
-    combined = np.nan_to_num(combined, nan=0.0, posinf=1e6, neginf=0.0)
+    return np.nan_to_num(combined, nan=0.0, posinf=1e6, neginf=0.0)
+
+def extract_features_from_iq_premium(iq_sample: np.ndarray) -> np.ndarray:
+    """
+    Extract 32-dimensional feature vector from I/Q samples.
+    """
+    if iq_sample.shape != (2, 128):
+        raise ValueError(f"Expected shape (2, 128), got {iq_sample.shape}")
+    
+    # 24D base
+    base_24 = extract_features_from_iq_extended(iq_sample)
+    
+    # Premium features
+    signal = iq_sample[0, :] + 1j * iq_sample[1, :]
+    premium = _extract_premium_features(signal)
+    
+    combined = np.concatenate([base_24, premium])
     return combined.astype(np.float32)
 
 
@@ -566,6 +645,7 @@ def extract_features(iq_sample: np.ndarray, mode: str = "16d") -> np.ndarray:
             ``"8d"``  — 8-dimensional analog AMC features
             ``"16d"`` — 16-dimensional traditional features (default)
             ``"24d"`` — 24-dimensional extended features
+            ``"32d"`` — 32-dimensional premium features
 
     Returns:
         Feature vector whose length matches the requested mode.
@@ -581,9 +661,11 @@ def extract_features(iq_sample: np.ndarray, mode: str = "16d") -> np.ndarray:
         return extract_features_from_iq(iq_sample, use_analog_features=False)
     elif mode == "24d":
         return extract_features_from_iq_extended(iq_sample)
+    elif mode == "32d":
+        return extract_features_from_iq_premium(iq_sample)
     else:
         raise ValueError(
-            f"Unknown feature mode '{mode}'. Choose from '8d', '16d', '24d'."
+            f"Unknown feature mode '{mode}'. Choose from '8d', '16d', '24d', '32d'."
         )
 
 
@@ -612,7 +694,7 @@ def process_dataset(
         use_analog_features: Legacy flag — if True, extract 8D analog
             features; if False, extract 16D traditional features.
             Ignored when *mode* is explicitly provided.
-        mode: ``"8d"``, ``"16d"`` or ``"24d"``.  When provided this
+        mode: ``"8d"``, ``"16d"``, ``"24d"``, or ``"32d"``. When provided this
             overrides *use_analog_features*.
 
     Returns:
@@ -626,7 +708,7 @@ def process_dataset(
     else:
         effective_mode = "8d" if use_analog_features else "16d"
 
-    dim_map = {"8d": 8, "16d": 16, "24d": 24}
+    dim_map = {"8d": 8, "16d": 16, "24d": 24, "32d": 32}
     if effective_mode not in dim_map:
         raise ValueError(
             f"Unknown feature mode '{effective_mode}'. "
@@ -670,7 +752,7 @@ def normalize_features(
     features: np.ndarray,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Normalize features using z-score normalization.
+    Normalize features using RobustScaler.
 
     Works with any feature dimensionality (8D, 16D, 24D, etc.).
 
@@ -678,17 +760,13 @@ def normalize_features(
         features: Feature array of shape (n_samples, D)
 
     Returns:
-        Tuple of (normalized_features, mean, std) where:
+        Tuple of (normalized_features, center, scale) where:
             - normalized_features: Normalized feature array
-            - mean: Mean values for each feature dimension
-            - std: Standard deviation for each feature dimension
+            - center: Median values for each feature dimension
+            - scale: Interquartile range for each feature dimension
     """
-    mean = np.mean(features, axis=0)
-    std = np.std(features, axis=0)
+    from sklearn.preprocessing import RobustScaler
+    scaler = RobustScaler()
+    normalized_features = scaler.fit_transform(features).astype(np.float32)
 
-
-    std = np.where(std == 0, 1, std)
-
-    normalized_features = (features - mean) / std
-
-    return normalized_features, mean, std
+    return normalized_features, scaler.center_, scaler.scale_

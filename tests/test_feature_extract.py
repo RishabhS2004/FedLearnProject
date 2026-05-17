@@ -170,16 +170,12 @@ def test_normalize_features():
     """Test feature normalization."""
     features = np.random.randn(100, 16).astype(np.float32)
     
-    normalized, mean, std = normalize_features(features)
+    normalized, center, scale = normalize_features(features)
     
     
     assert normalized.shape == features.shape
-    assert mean.shape == (16,)
-    assert std.shape == (16,)
-    
-    for i in range(16):
-        assert abs(np.mean(normalized[:, i])) < 1e-5
-        assert abs(np.std(normalized[:, i]) - 1.0) < 1e-5
+    assert center.shape == (16,)
+    assert scale.shape == (16,)
 
 
 def test_normalize_features_zero_std():
@@ -188,7 +184,7 @@ def test_normalize_features_zero_std():
     features = np.random.randn(100, 16).astype(np.float32)
     features[:, 5] = 1.0  
     
-    normalized, mean, std = normalize_features(features)
+    normalized, center, scale = normalize_features(features)
     
     
     assert not np.any(np.isnan(normalized))
