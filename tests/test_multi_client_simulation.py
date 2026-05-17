@@ -203,7 +203,7 @@ def simulate_client_training(client_id, partition_id, server_url="http://localho
         print_info(f"  Training Time: {results['training_time']:.3f}s")
         print_info(f"  Inference Time: {results['inference_time_ms_per_sample']:.3f} ms/sample")
         
-        model_dir = Path("client/local")
+        model_dir = Path("out/checkpoints/client")
         model_dir.mkdir(parents=True, exist_ok=True)
         model_path = model_dir / f"client_{client_id}_knn.pkl"
         
@@ -417,7 +417,7 @@ def verify_dashboard_metrics(server_url="http://localhost:8000"):
         return False
 
 
-def run_simulation(num_clients=3, server_url="http://localhost:8000"):
+def run_simulation(num_clients=3, server_url="http://localhost:8000", dropout_rate=0.0):
     """
     Run complete multi-client federated learning simulation.
     
@@ -433,6 +433,7 @@ def run_simulation(num_clients=3, server_url="http://localhost:8000"):
     print_info(f"  Number of clients: {num_clients}")
     print_info(f"  Model type: KNN")
     print_info(f"  Server URL: {server_url}")
+    print_info(f"  Dropout Rate: {dropout_rate}")
     
     
     if not check_partitions_exist(num_clients):
@@ -449,6 +450,11 @@ def run_simulation(num_clients=3, server_url="http://localhost:8000"):
     
     for i in range(num_clients):
         client_id = f"sim_client_{i}"
+        
+        if np.random.rand() < dropout_rate:
+            print_warning(f"Client {client_id} disconnected (simulated dropout)")
+            continue
+            
         result = simulate_client_training(client_id, i, server_url)
         
         if result is None:
@@ -457,6 +463,10 @@ def run_simulation(num_clients=3, server_url="http://localhost:8000"):
         
         client_results.append(result)
         time.sleep(1)  
+        
+    if not client_results:
+        print_error("All clients dropped out or failed. Simulation cannot continue.")
+        return False
     
     print_success(f"\nAll {num_clients} clients trained successfully")
     
@@ -541,11 +551,19 @@ Examples:
         help='Central server URL (default: http://localhost:8000)'
     )
     
+    parser.add_argument(
+        '--dropout',
+        type=float,
+        default=0.0,
+        help='Probability of a client dropping out (default: 0.0)'
+    )
+    
     args = parser.parse_args()
     
     success = run_simulation(
         num_clients=args.num_clients,
-        server_url=args.server_url
+        server_url=args.server_url,
+        dropout_rate=args.dropout
     )
     
     
