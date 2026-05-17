@@ -91,7 +91,7 @@ def _initialize_server():
     except Exception as e:
         print(f"Warning: Could not load config, using defaults: {e}")
         config = {
-            "model_save_path": "./central/model_store/global_knn_model.pkl",
+            "model_save_path": "out/checkpoints/central/global_knn_model.pkl",
             "host": "0.0.0.0",
             "port": 8000,
             "log_level": "INFO",
@@ -122,11 +122,43 @@ async def startup_event():
     _initialize_server()
 
 
+def _save_model_metadata(model_path: str, result: dict, participating_clients: list, round_start_time: float, timestamp: str):
+    try:
+        import json, time, os
+        from central.state import get_current_round
+        
+        metadata = {
+            "round_number": get_current_round(),
+            "timestamp": timestamp,
+            "participating_clients": participating_clients,
+            "evaluation_metrics": result.get('evaluation', {}),
+            "training_duration_seconds": time.time() - round_start_time,
+            "aggregation_summary": result.get('defense_report', {})
+        }
+        
+        # Determine metadata path based on model path
+        base_name = os.path.splitext(model_path)[0]
+        # Append timestamp to avoid overwriting previous metadata
+        safe_timestamp = timestamp.replace(':', '').replace('-', '')
+        metadata_path = f"{base_name}_{safe_timestamp}_metadata.json"
+        
+        os.makedirs(os.path.dirname(metadata_path), exist_ok=True)
+        with open(metadata_path, 'w') as f:
+            json.dump(metadata, f, indent=4)
+            
+        logger.info(f"Model metadata saved to {metadata_path}")
+    except Exception as e:
+        logger.error(f"Failed to save model metadata: {e}")
+
 def perform_auto_aggregation():
     """Execute complete auto-aggregation workflow with Byzantine filtering."""
     global _aggregation_in_progress, last_aggregation_time
 
     try:
+        import time
+        round_start_time = time.time()
+        timestamp = datetime.now().strftime('%Y-%m-%dT%H:%M:%S')
+        logger.info(f"[{timestamp}] === Federated Learning Round Started ===")
         logger.info("Starting auto-aggregation workflow...")
 
         # Capture before-aggregation metrics
@@ -147,6 +179,10 @@ def perform_auto_aggregation():
             logger.warning("No client models available")
             return
 
+        participating_clients = [c.get('client_id', 'unknown') for c in client_weights_info]
+        log_timestamp = datetime.now().strftime('%Y-%m-%dT%H:%M:%S')
+        logger.info(f"[{log_timestamp}] Client participation: {len(participating_clients)} clients. IDs: {participating_clients}")
+
         knn_clients = [c for c in client_weights_info if c.get('model_type', 'knn') == 'knn']
         timestamp = datetime.now().isoformat()
 
@@ -158,7 +194,8 @@ def perform_auto_aggregation():
                     byzantine_filtering=True
                 )
                 save_knn_model(result['global_model'],
-                             "./central/model_store/global_knn_model.pkl")
+                             "out/checkpoints/central/global_knn_model.pkl")
+                _save_model_metadata("out/checkpoints/central/global_knn_model.pkl", result, participating_clients, round_start_time, timestamp)
                 store_aggregation_result('knn', result, timestamp)
                 logger.info(f"KNN aggregation: {result['num_clients']} clients, "
                           f"accuracy={result.get('accuracy', 0):.4f}")
@@ -177,7 +214,8 @@ def perform_auto_aggregation():
                     dt_clients, evaluate=True, byzantine_filtering=True
                 )
                 save_dt_model(result['global_model'],
-                            "./central/model_store/global_dt_model.pkl")
+                            "out/checkpoints/central/global_dt_model.pkl")
+                _save_model_metadata("out/checkpoints/central/global_dt_model.pkl", result, participating_clients, round_start_time, timestamp)
                 store_aggregation_result('dt', result, timestamp)
                 logger.info(f"DT aggregation: accuracy={result.get('accuracy', 0):.4f}")
             except Exception as e:
@@ -206,7 +244,40 @@ def perform_auto_aggregation():
             logger.error(f"Failed to reset state: {e}")
 
         last_aggregation_time = datetime.now().isoformat()
-        logger.info("Auto-aggregation workflow completed.")
+        log_timestamp = datetime.now().strftime('%Y-%m-%dT%H:%M:%S')
+
+        # Generate post-round visualization plots
+        try:
+            from central.state import get_historical_metrics_history, get_latest_metrics
+            from central.visualization import (
+                generate_accuracy_vs_rounds_plot,
+                generate_client_contribution_plot,
+                generate_per_client_accuracy_plot
+            )
+            
+            history = get_historical_metrics_history()
+            latest = get_latest_metrics()
+            
+            file_timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            
+            generate_accuracy_vs_rounds_plot(history, f"out/plots/accuracy_vs_rounds_{file_timestamp}.png")
+            generate_client_contribution_plot(latest, f"out/plots/client_contribution_{file_timestamp}.png")
+            generate_per_client_accuracy_plot(latest, f"out/plots/per_client_accuracy_{file_timestamp}.png")
+            
+            logger.info(f"[{log_timestamp}] Publication-style visualizations generated and saved to out/plots/")
+        except Exception as e:
+            logger.error(f"Failed to generate visualization plots: {e}")
+
+        # Generate experiment reports
+        try:
+            from central.report_exporter import export_round_reports
+            export_round_reports(file_timestamp)
+            logger.info(f"[{log_timestamp}] Experiment reports exported to out/reports/")
+        except Exception as e:
+            logger.error(f"Failed to export experiment reports: {e}")
+
+        logger.info(f"[{log_timestamp}] Aggregation workflow completed.")
+        logger.info(f"[{log_timestamp}] === Federated Learning Round Completed ===")
 
     except Exception as e:
         logger.error(f"Auto-aggregation failed: {e}", exc_info=True)
@@ -308,7 +379,7 @@ async def upload_model(
         if n_samples <= 0:
             raise HTTPException(status_code=400, detail="n_samples must be positive")
 
-        models_dir = "./central/model_store"
+        models_dir = "out/checkpoints/central"
         os.makedirs(models_dir, exist_ok=True)
 
         # Save uploaded files
@@ -379,7 +450,7 @@ async def aggregate():
         timestamp = datetime.now().isoformat()
         result = aggregate_knn_models(knn_clients, n_neighbors=5, evaluate=True,
                                      byzantine_filtering=True)
-        save_knn_model(result['global_model'], "./central/model_store/global_knn_model.pkl")
+        save_knn_model(result['global_model'], "out/checkpoints/central/global_knn_model.pkl")
         store_aggregation_result('knn', result, timestamp)
 
         last_aggregation_time = timestamp
@@ -413,7 +484,9 @@ async def aggregate():
 async def get_global_model():
     _initialize_server()
     try:
-        path = "./central/model_store/global_knn_model.pkl"
+        path = "out/checkpoints/central/global_knn_model.pkl"
+        if not os.path.exists(path):
+            path = "./central/model_store/global_knn_model.pkl"
         if not os.path.exists(path):
             raise HTTPException(status_code=404, detail="Global model not found")
         return FileResponse(path, media_type="application/octet-stream",
@@ -504,12 +577,16 @@ async def get_status():
         stats = get_registry_stats()
         trust_scores = get_all_trust_scores()
 
+        model_path = "out/checkpoints/central/global_knn_model.pkl"
+        if not os.path.exists(model_path):
+            model_path = "./central/model_store/global_knn_model.pkl"
+
         return JSONResponse(status_code=200, content={
             "server_status": "running",
             "version": "2.0.0",
             "timestamp": datetime.now().isoformat(),
             "last_aggregation": last_aggregation_time,
-            "global_model_exists": os.path.exists("./central/model_store/global_knn_model.pkl"),
+            "global_model_exists": os.path.exists(model_path),
             "total_clients": stats['total_clients'],
             "total_samples": stats['total_samples'],
             "trust_scores": trust_scores,

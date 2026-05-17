@@ -63,7 +63,7 @@ def save_config(config: Dict, config_path: str = "./client/config.json") -> None
 
 def save_metrics(
     metrics: Dict[str, Any],
-    metrics_path: str = "./client/local/metrics.json"
+    metrics_path: str = "out/checkpoints/client/metrics.json"
 ) -> None:
     """
     Save training metrics to local/metrics.json file.
@@ -86,7 +86,7 @@ def save_metrics(
         json.dump(metrics, f, indent=2)
 
 
-def load_metrics(metrics_path: str = "./client/local/metrics.json") -> Optional[Dict]:
+def load_metrics(metrics_path: str = "out/checkpoints/client/metrics.json") -> Optional[Dict]:
     """
     Load training metrics from local/metrics.json file.
     

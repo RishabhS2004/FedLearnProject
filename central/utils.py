@@ -29,6 +29,13 @@ def setup_logging(log_level: str = "INFO") -> logging.Logger:
    
     if not logger.handlers:
         logger.addHandler(handler)
+        
+        # Add file handler
+        os.makedirs("out/logs", exist_ok=True)
+        file_handler = logging.FileHandler("out/logs/central.log")
+        file_handler.setLevel(getattr(logging, log_level.upper()))
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
     
     return logger
 
@@ -36,11 +43,20 @@ def setup_logging(log_level: str = "INFO") -> logging.Logger:
 def ensure_directories() -> None:
     """
     Create necessary directories for the central server if they don't exist.
-    Creates: central/model_store/, data/
+    Creates: central/model_store/, data/ and out/ directories
     """
     directories = [
         "central/model_store",
-        "data"
+        "data",
+        "out/checkpoints/central",
+        "out/checkpoints/client",
+        "out/logs",
+        "out/plots",
+        "out/plots/confusion_matrix",
+        "out/plots/byzantine",
+        "out/metrics",
+        "out/reports",
+        "out/predictions"
     ]
     
     for directory in directories:

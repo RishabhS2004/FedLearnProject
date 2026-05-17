@@ -30,10 +30,14 @@ def initialize():
     try:
         config = load_config()
     except Exception:
+        from config_loader import get_config_val
         config = {
             "model_save_path": "./central/model_store/global_knn_model.pkl",
-            "host": "127.0.0.1", "port": 8000, "log_level": "INFO",
-            "auto_aggregation_enabled": True, "auto_aggregation_threshold": 2,
+            "host": get_config_val("server", "host") or "127.0.0.1",
+            "port": get_config_val("server", "port") or 8000,
+            "log_level": "INFO",
+            "auto_aggregation_enabled": True,
+            "auto_aggregation_threshold": 2,
         }
 
 

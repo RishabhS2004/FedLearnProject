@@ -191,8 +191,9 @@ def _load_cfg():
     try: S.config=load_config()
     except Exception:
         import random,string
+        from config_loader import get_config_val
         rid="".join(random.choices(string.ascii_lowercase+string.digits,k=6))
-        S.config={"client_id":f"client_{rid}","server_url":"http://localhost:8000","dataset_path":"./data/RML2016.10a_dict.pkl","local_model_path":"./client/local/local_model.pth","training":{"epochs":10,"batch_size":32,"learning_rate":0.001},"partition_id":0}
+        S.config={"client_id":f"client_{rid}","server_url":"http://localhost:8000","dataset_path":"./data/RML2016.10a_dict.pkl","local_model_path":"out/checkpoints/client/local_model.pth","training":{"epochs":get_config_val("training", "epochs") or 10,"batch_size":get_config_val("training", "batch_size") or 32,"learning_rate":get_config_val("training", "learning_rate") or 0.001},"partition_id":0}
 
 # ── App ──────────────────────────────────────────────────────────────────────
 
@@ -502,7 +503,7 @@ def create_client_app(port=7861):
             return P(f"Error: {e}",cls="tr")
 
     def _save_art(r,code):
-        mp=S.config.get("local_model_path","./client/local/local_model.pth").replace(".pth",f"_{code}.pkl")
+        mp=S.config.get("local_model_path","out/checkpoints/client/local_model.pth").replace(".pth",f"_{code}.pkl")
         _save_model(r["model"],mp)
         fp=mp.replace(f"_{code}.pkl",f"_{code}_features.pkl"); lp=mp.replace(f"_{code}.pkl",f"_{code}_labels.pkl")
         os.makedirs(os.path.dirname(fp),exist_ok=True)
@@ -548,7 +549,7 @@ def create_client_app(port=7861):
     @app.post("/a/dl")
     def adl():
         try:
-            ok=download_global_model(S.config["server_url"],"./client/local/global_knn_model.pkl",timeout=30)
+            ok=download_global_model(S.config["server_url"],"out/checkpoints/client/global_knn_model.pkl",timeout=30)
             return Span("Downloaded",cls="bg bg-g",style="font-size:.85rem;padding:6px 14px") if ok else P("Failed",cls="tr")
         except Exception as e: return P(f"Error: {e}",cls="tr")
 
